@@ -1,27 +1,18 @@
 # NC-TK17-WebM
 
-## Automatic room Twitch target
+NC-TK17-WebM is a 32-bit Windows extension for The Klub 17 that adds modern
+WebM playback and optional Twitch streaming and chat support.
 
-The in-game WebM settings target list includes **Auto assign (Rooms only)**. It is
-stored in `Binaries/NC-TK17-WebM.ini` as:
+## Build
 
-```ini
-[NC-TK17-WebM:TwitchOverride]
-target=auto_room
+Install the MSYS2 MinGW 32-bit toolchain, then run this from the repository
+root in PowerShell:
+
+```powershell
+C:\msys64\mingw32\bin\gcc.exe -m32 -shared -O2 -s -static-libgcc `
+  -o build\NC-TK17-WEBM.dll `
+  NC-TK17-WebM.c webm_channel_dialog.c webm_twitch.c `
+  webm_twitch_auth.c webm_twitch_chat.c webm_twitch_emotes.c `
+  -lole32 -luuid -ld3d8 -ld3d11 -lgdi32 -lwinhttp -lcrypt32 `
+  -lshell32 -luser32
 ```
-
-When the Twitch override is enabled, Auto mode selects the first compatible
-sidecar detected while the current room loads. A sidecar is compatible when it
-contains `[NC-TK17-WebM]`, `[NC-TK17-WebM:Twitch]`, or both. The outer add-on
-folder name is not used for classification; room scope comes from the sidecar's
-internal `Luder/Room/<room>` path.
-
-Only one room sidecar is overridden at a time. The temporary target is cleared
-when its texture unloads, allowing the next room to select its own first
-compatible sidecar. Rooms without a compatible sidecar receive no override, and
-sidecars belonging to toys, items, tools, or other non-room add-ons are ignored
-by Auto mode.
-
-Selecting an explicit target path retains the existing fixed-target behavior.
-Disabling the override restores the sidecar's normal Twitch, WebM, or image
-behavior.
