@@ -116,6 +116,7 @@ typedef void *(__cdecl *app_find_objc_t)(const char *);
 typedef void (__cdecl *model_pivot_t)(void *, float *);
 typedef void (THISCALL *sound_receiver_get_all_parameters_t)(void *, float *, float *, float *, float *, float *, float *, float *);
 typedef void *(__cdecl *sound_device_create_t)(int, int, int, void *);
+typedef void *(THISCALL *sound_device_create_source_t)(void *, const char *, unsigned int, int);
 typedef void *(__cdecl *sound_source_create_t)(void *, const char *, unsigned int, int);
 typedef int (THISCALL *sound_source_play_t)(void *, int, int);
 typedef void (THISCALL *sound_source_stop_t)(void *);
@@ -124,6 +125,8 @@ typedef int (THISCALL *sound_source_set_play_position_t)(void *, unsigned int);
 typedef void (THISCALL *sound_source_set_position_t)(void *, float *, int);
 typedef void (THISCALL *sound_source_set_distances_t)(void *, float, float, int);
 typedef void (THISCALL *sound_source_set_volume_t)(void *, float, int);
+typedef float (THISCALL *sound_source_get_volume_t)(void *);
+typedef void (THISCALL *sound_source_destroy_t)(void *);
 typedef void *(THISCALL *apptracker_get_camera_transform_t)(void *);
 typedef void (THISCALL *apptracker_set_camera_transform_t)(void *, void *);
 typedef void (THISCALL *apptracker_set_world_matrix_inverse_t)(void *, const float *);
@@ -350,6 +353,7 @@ static void **engine_SoundReceiver_ptr;
 static void **engine_SoundDevice_ptr;
 static sound_device_create_t real_SoundDevice_Create;
 static sound_device_create_t tramp_SoundDevice_Create;
+static sound_device_create_source_t real_SoundDevice_CreateSource;
 static sound_source_create_t engine_SoundSource_Create;
 static sound_source_play_t engine_SoundSource_Play;
 static sound_source_stop_t engine_SoundSource_Stop;
@@ -358,6 +362,9 @@ static sound_source_set_play_position_t engine_SoundSource_SetPlayPosition;
 static sound_source_set_position_t engine_SoundSource_SetPosition;
 static sound_source_set_distances_t engine_SoundSource_SetDistances;
 static sound_source_set_volume_t engine_SoundSource_SetVolume;
+static sound_source_get_volume_t engine_SoundSource_GetVolume;
+static sound_source_destroy_t real_SoundSource_Destroy;
+static sound_source_destroy_t tramp_SoundSource_Destroy;
 static apptracker_get_camera_transform_t real_AppTracker_GetCameraTransform;
 static apptracker_get_camera_transform_t tramp_AppTracker_GetCameraTransform;
 static apptracker_set_camera_transform_t real_AppTracker_SetCameraTransform;
@@ -370,6 +377,8 @@ static int engine_captured_camera_inverse_valid;
 static DWORD engine_captured_camera_inverse_tick;
 static int engine_audio_symbols_attempted;
 static int sound_device_create_inline_installed;
+static int sound_device_create_source_vtable_installed;
+static int sound_source_destroy_inline_installed;
 static int apptracker_camera_transform_inline_installed;
 static int apptracker_set_camera_transform_inline_installed;
 static int apptracker_world_matrix_inverse_inline_installed;
@@ -847,6 +856,30 @@ enum {
     WEBM_UV_MODE_FULL_TEXTURE = 1
 };
 
+#define WEBM_GAME_AUDIO_MUTE_MAX_NAMES 16
+#define WEBM_GAME_AUDIO_MUTE_NAME_MAX 128
+#define WEBM_GAME_AUDIO_MUTE_MAX_SOURCES 128
+#define WEBM_GAME_AUDIO_SILENT_VOLUME (-100.0f)
+
+typedef struct {
+    int count;
+    char names[WEBM_GAME_AUDIO_MUTE_MAX_NAMES][WEBM_GAME_AUDIO_MUTE_NAME_MAX];
+} game_audio_mute_list_t;
+
+typedef struct {
+    void *source;
+    char full_name[WEBM_GAME_AUDIO_MUTE_NAME_MAX];
+    char base_name[WEBM_GAME_AUDIO_MUTE_NAME_MAX];
+    float saved_volume;
+    int muted;
+} game_audio_mute_source_t;
+
+static CRITICAL_SECTION game_audio_mute_lock;
+static int game_audio_mute_lock_ready;
+static game_audio_mute_source_t game_audio_mute_sources[WEBM_GAME_AUDIO_MUTE_MAX_SOURCES];
+static int game_audio_mute_source_count;
+static game_audio_mute_list_t game_audio_active_mutes;
+
 typedef struct {
     int active;
     unsigned int texture;
@@ -876,6 +909,7 @@ typedef struct {
     float uv_max_u;
     float uv_max_v;
     int uv_override_logged;
+    game_audio_mute_list_t game_audio_mutes;
     int decoder_attempted;
     webm_source_failure_state_t source_failure;
     int audio_enabled;
@@ -951,6 +985,7 @@ typedef struct {
     float uv_max_u;
     float uv_max_v;
     int uv_override_logged;
+    game_audio_mute_list_t game_audio_mutes;
     unsigned int filter_log_generation;
     int filter_log_filtering;
     int filter_log_anisotropy;
@@ -1181,6 +1216,10 @@ static void video_decoder_release(video_decoder_t *dec);
 static void video_decoder_stop_async(video_decoder_t *dec);
 static void patch_d3d8_object(IDirect3D8 *d3d);
 static void patch_d3d8_device(IDirect3DDevice8 *dev);
+static int patch_vtable_slot(void *obj, int index, void *hook, void **real);
+static void game_audio_track_source(void *source, const char *name);
+static void *THISCALL hook_SoundDeviceCreateSource(void *device, const char *name,
+                                                    unsigned int flags, int cache_mode);
 
 typedef struct {
     HANDLE handle;
@@ -2486,12 +2525,17 @@ static void resolve_engine_audio_symbols(void)
             (sound_source_set_distances_t)GetProcAddress(sys, "?SetDistances@SoundSource@Bionic@@UAEXMM_N@Z");
         engine_SoundSource_SetVolume =
             (sound_source_set_volume_t)GetProcAddress(sys, "?SetVolume@SoundSource@Bionic@@UAEXM_N@Z");
+        engine_SoundSource_GetVolume =
+            (sound_source_get_volume_t)GetProcAddress(sys, "?GetVolume@SoundSource@Bionic@@UBEMXZ");
+        real_SoundSource_Destroy =
+            (sound_source_destroy_t)GetProcAddress(sys, "??1SoundSource_D@Bionic@@QAE@XZ");
     }
-    debug_line("Audio3D symbols FindObjC=%p Pivot=%p ReceiverGet=%p ReceiverSlot=%p SoundDeviceSlot=%p SoundDeviceCreate=%p SourceCreate=%p",
+    debug_line("Audio3D symbols FindObjC=%p Pivot=%p ReceiverGet=%p ReceiverSlot=%p SoundDeviceSlot=%p SoundDeviceCreate=%p SourceCreate=%p SourceGetVolume=%p SourceDestroy=%p",
                (void*)engine_FindObjC, (void*)engine_GetModelViewRotationPivot,
                (void*)engine_SoundReceiver_GetAllParameters, (void*)engine_SoundReceiver_ptr,
                (void*)engine_SoundDevice_ptr, (void*)real_SoundDevice_Create,
-               (void*)engine_SoundSource_Create);
+               (void*)engine_SoundSource_Create, (void*)engine_SoundSource_GetVolume,
+               (void*)real_SoundSource_Destroy);
 }
 
 static HRESULT basic_audio_put_volume(void *basic_audio, long volume)
@@ -6675,6 +6719,89 @@ static int read_video_uv_mode_section_a(const char *ini, const char *section,
     return parse_video_uv_mode_a(value, fallback, section, ini);
 }
 
+static void normalize_game_audio_name_a(const char *value, char *out, size_t outsz)
+{
+    const char *start;
+    const char *end;
+    size_t length;
+    size_t i;
+    if (!out || !outsz) return;
+    out[0] = 0;
+    if (!value) return;
+    start = value;
+    while (*start && isspace((unsigned char)*start)) start++;
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    if (end - start >= 2 && start[0] == '"' && end[-1] == '"') {
+        start++;
+        end--;
+        while (start < end && isspace((unsigned char)*start)) start++;
+        while (end > start && isspace((unsigned char)end[-1])) end--;
+    }
+    length = (size_t)(end - start);
+    if (length >= outsz) length = outsz - 1;
+    for (i = 0; i < length; i++) {
+        char ch = start[i];
+        out[i] = ch == '\\' ? '/' : ch;
+    }
+    out[length] = 0;
+    while (length && out[length - 1] == '/') out[--length] = 0;
+    if (length > 4 && _stricmp(out + length - 4, ".ogg") == 0) {
+        out[length - 4] = 0;
+    }
+}
+
+static void game_audio_mute_list_add_a(game_audio_mute_list_t *list, const char *value)
+{
+    char normalized[WEBM_GAME_AUDIO_MUTE_NAME_MAX];
+    int i;
+    if (!list || !value || list->count >= WEBM_GAME_AUDIO_MUTE_MAX_NAMES) return;
+    normalize_game_audio_name_a(value, normalized, sizeof(normalized));
+    if (!normalized[0]) return;
+    for (i = 0; i < list->count; i++) {
+        if (_stricmp(list->names[i], normalized) == 0) return;
+    }
+    lstrcpynA(list->names[list->count], normalized, WEBM_GAME_AUDIO_MUTE_NAME_MAX);
+    list->count++;
+}
+
+static void game_audio_mute_list_parse_a(game_audio_mute_list_t *list, char *value)
+{
+    char *item;
+    char *next;
+    if (!list || !value) return;
+    item = value;
+    while (item && *item) {
+        next = strchr(item, ',');
+        if (next) *next++ = 0;
+        game_audio_mute_list_add_a(list, item);
+        item = next;
+    }
+}
+
+static void load_sidecar_game_audio_mutes_a(const char *sidecar, game_audio_mute_list_t *list)
+{
+    static const char *sections[] = {"NC-TK17-WebM", "NC-TK17-WebM:Twitch"};
+    char ini[MAX_PATH * 4];
+    char value[1024];
+    int i;
+    if (!list) return;
+    memset(list, 0, sizeof(*list));
+    if (!sidecar || !sidecar[0]) return;
+    sidecar_ini_path_a(sidecar, ini, sizeof(ini));
+    if (!ini[0] || !regular_file_exists_a(ini)) return;
+    for (i = 0; i < (int)(sizeof(sections) / sizeof(sections[0])); i++) {
+        value[0] = 0;
+        GetPrivateProfileStringA(sections[i], "mute_game_audio", "",
+                                 value, sizeof(value), ini);
+        value[sizeof(value) - 1] = 0;
+        game_audio_mute_list_parse_a(list, value);
+    }
+    if (list->count) {
+        debug_line("GameAudio sidecar mute targets=%d ini=\"%s\"", list->count, ini);
+    }
+}
+
 static void load_sidecar_uv_settings_a(const char *sidecar,
                                        int *base_mode, int *twitch_mode, int *rect_valid,
                                        float *min_u, float *min_v, float *max_u, float *max_v)
@@ -10018,6 +10145,15 @@ static int THISCALL hook_PngImport(void *self, int a, void *stream, int c, int d
     return real_PngImport ? real_PngImport(self, a, stream, c, d) : 0x80000008;
 }
 
+static void *THISCALL hook_SoundDeviceCreateSource(void *device, const char *name,
+                                                    unsigned int flags, int cache_mode)
+{
+    void *source = real_SoundDevice_CreateSource ?
+        real_SoundDevice_CreateSource(device, name, flags, cache_mode) : NULL;
+    if (source) game_audio_track_source(source, name);
+    return source;
+}
+
 static void *__cdecl hook_SoundDeviceCreate(int sd_type, int speaker_type, int quality, void *window)
 {
     void *ret = NULL;
@@ -10026,7 +10162,20 @@ static void *__cdecl hook_SoundDeviceCreate(int sd_type, int speaker_type, int q
     } else if (real_SoundDevice_Create && real_SoundDevice_Create != hook_SoundDeviceCreate) {
         ret = real_SoundDevice_Create(sd_type, speaker_type, quality, window);
     }
-    if (ret) engine_captured_sound_device = ret;
+    if (ret) {
+        engine_captured_sound_device = ret;
+        if (sound_source_destroy_inline_installed &&
+            patch_vtable_slot(ret, 1, (void*)hook_SoundDeviceCreateSource,
+                              (void**)&real_SoundDevice_CreateSource)) {
+            if (!sound_device_create_source_vtable_installed) {
+                sound_device_create_source_vtable_installed = 1;
+                debug_line("GameAudio SoundDevice source vtable hook installed device=%p original=%p",
+                           ret, (void*)real_SoundDevice_CreateSource);
+            }
+        } else if (sound_source_destroy_inline_installed) {
+            log_line("GameAudio SoundDevice source vtable hook install failed device=%p", ret);
+        }
+    }
     debug_line("EngineAudio SoundDevice::Create type=%d speaker=%d quality=%d window=%p ret=%p slot=%p slot_device=%p",
              sd_type, speaker_type, quality, window, ret,
              (void*)engine_SoundDevice_ptr,
@@ -10325,6 +10474,168 @@ static int patch_vtable_slot(void *obj, int index, void *hook, void **real)
     return 1;
 }
 
+static int game_audio_name_matches_a(const game_audio_mute_source_t *source, const char *target)
+{
+    size_t source_length;
+    size_t target_length;
+    if (!source || !target || !target[0]) return 0;
+    if (strchr(target, '/')) {
+        if (_stricmp(source->full_name, target) == 0) return 1;
+        source_length = strlen(source->full_name);
+        target_length = strlen(target);
+        return source_length > target_length &&
+               source->full_name[source_length - target_length - 1] == '/' &&
+               _stricmp(source->full_name + source_length - target_length, target) == 0;
+    }
+    return _stricmp(source->base_name, target) == 0;
+}
+
+static int game_audio_source_should_mute(const game_audio_mute_source_t *source,
+                                         const game_audio_mute_list_t *list)
+{
+    int i;
+    if (!source || !list) return 0;
+    for (i = 0; i < list->count; i++) {
+        if (game_audio_name_matches_a(source, list->names[i])) return 1;
+    }
+    return 0;
+}
+
+static void game_audio_set_source_muted(game_audio_mute_source_t *entry, int mute)
+{
+    if (!entry || !entry->source || !engine_SoundSource_SetVolume) return;
+    if (mute && !entry->muted) {
+        entry->saved_volume = engine_SoundSource_GetVolume ?
+            engine_SoundSource_GetVolume(entry->source) : 1.0f;
+        engine_SoundSource_SetVolume(entry->source, WEBM_GAME_AUDIO_SILENT_VOLUME, 1);
+        entry->muted = 1;
+        debug_line("GameAudio muted source=\"%s\" volume=%.3f", entry->full_name, entry->saved_volume);
+    } else if (!mute && entry->muted) {
+        engine_SoundSource_SetVolume(entry->source, entry->saved_volume, 1);
+        entry->muted = 0;
+        debug_line("GameAudio restored source=\"%s\" volume=%.3f", entry->full_name, entry->saved_volume);
+    }
+}
+
+static void game_audio_track_source(void *source, const char *name)
+{
+    char normalized[WEBM_GAME_AUDIO_MUTE_NAME_MAX];
+    const char *base;
+    game_audio_mute_source_t *entry = NULL;
+    int i;
+    if (!game_audio_mute_lock_ready || !source || !name) return;
+    normalize_game_audio_name_a(name, normalized, sizeof(normalized));
+    if (!normalized[0]) return;
+    base = strrchr(normalized, '/');
+    base = base ? base + 1 : normalized;
+    EnterCriticalSection(&game_audio_mute_lock);
+    for (i = 0; i < game_audio_mute_source_count; i++) {
+        if (game_audio_mute_sources[i].source == source) {
+            entry = &game_audio_mute_sources[i];
+            break;
+        }
+    }
+    if (!entry && game_audio_mute_source_count < WEBM_GAME_AUDIO_MUTE_MAX_SOURCES) {
+        entry = &game_audio_mute_sources[game_audio_mute_source_count++];
+        memset(entry, 0, sizeof(*entry));
+        entry->source = source;
+    }
+    if (entry) {
+        lstrcpynA(entry->full_name, normalized, sizeof(entry->full_name));
+        lstrcpynA(entry->base_name, base, sizeof(entry->base_name));
+        game_audio_set_source_muted(entry,
+            game_audio_source_should_mute(entry, &game_audio_active_mutes));
+    }
+    LeaveCriticalSection(&game_audio_mute_lock);
+    if (!entry) log_line("GameAudio source registry full; source=\"%s\"", normalized);
+}
+
+static void game_audio_untrack_source(void *source)
+{
+    int i;
+    if (!game_audio_mute_lock_ready || !source) return;
+    EnterCriticalSection(&game_audio_mute_lock);
+    for (i = 0; i < game_audio_mute_source_count; i++) {
+        if (game_audio_mute_sources[i].source == source) {
+            game_audio_mute_source_count--;
+            if (i != game_audio_mute_source_count) {
+                game_audio_mute_sources[i] = game_audio_mute_sources[game_audio_mute_source_count];
+            }
+            memset(&game_audio_mute_sources[game_audio_mute_source_count], 0,
+                   sizeof(game_audio_mute_sources[0]));
+            break;
+        }
+    }
+    LeaveCriticalSection(&game_audio_mute_lock);
+}
+
+static void THISCALL hook_SoundSourceDestroy(void *source)
+{
+    game_audio_untrack_source(source);
+    if (tramp_SoundSource_Destroy) {
+        tramp_SoundSource_Destroy(source);
+    } else if (real_SoundSource_Destroy && real_SoundSource_Destroy != hook_SoundSourceDestroy) {
+        real_SoundSource_Destroy(source);
+    }
+}
+
+static int game_audio_gl_slot_displays_plugin(const video_gl_texture_t *slot)
+{
+    int mode;
+    if (!slot || !slot->active || slot->uploaded_frame_index < 0 || !slot->game_audio_mutes.count) return 0;
+    if (!slot->video_texture) return 1;
+    mode = slot->twitch_active ? slot->uv_mode_twitch : slot->uv_mode_base;
+    return slot->uv_rect_valid && mode == WEBM_UV_MODE_FULL_TEXTURE;
+}
+
+static int game_audio_d3d8_slot_displays_plugin(const video_d3d8_texture_t *slot)
+{
+    int mode;
+    if (!slot || !slot->active || slot->uploaded_frame_index < 0 || !slot->game_audio_mutes.count) return 0;
+    if (!slot->video_texture) return 1;
+    mode = slot->twitch_active ? slot->uv_mode_twitch : slot->uv_mode_base;
+    return slot->uv_rect_valid && mode == WEBM_UV_MODE_FULL_TEXTURE;
+}
+
+static void game_audio_collect_active_mutes(game_audio_mute_list_t *active)
+{
+    int i;
+    int j;
+    if (!active) return;
+    memset(active, 0, sizeof(*active));
+    for (i = 0; i < video_gl_active_count; i++) {
+        video_gl_texture_t *slot = video_gl_active_slots[i];
+        if (!game_audio_gl_slot_displays_plugin(slot)) continue;
+        for (j = 0; j < slot->game_audio_mutes.count; j++) {
+            game_audio_mute_list_add_a(active, slot->game_audio_mutes.names[j]);
+        }
+    }
+    for (i = 0; i < video_d3d8_active_count; i++) {
+        video_d3d8_texture_t *slot = video_d3d8_active_slots[i];
+        if (!game_audio_d3d8_slot_displays_plugin(slot)) continue;
+        for (j = 0; j < slot->game_audio_mutes.count; j++) {
+            game_audio_mute_list_add_a(active, slot->game_audio_mutes.names[j]);
+        }
+    }
+}
+
+static void game_audio_refresh_mutes(void)
+{
+    game_audio_mute_list_t active;
+    int i;
+    if (!game_audio_mute_lock_ready) return;
+    game_audio_collect_active_mutes(&active);
+    EnterCriticalSection(&game_audio_mute_lock);
+    if (memcmp(&active, &game_audio_active_mutes, sizeof(active)) != 0) {
+        game_audio_active_mutes = active;
+        for (i = 0; i < game_audio_mute_source_count; i++) {
+            game_audio_set_source_muted(&game_audio_mute_sources[i],
+                game_audio_source_should_mute(&game_audio_mute_sources[i], &game_audio_active_mutes));
+        }
+    }
+    LeaveCriticalSection(&game_audio_mute_lock);
+}
+
 static video_d3d8_texture_t *find_d3d8_texture_slot(IDirect3DTexture8 *texture)
 {
     int i;
@@ -10504,6 +10815,7 @@ static void remember_d3d8_texture(IDirect3DDevice8 *device, IDirect3DTexture8 *t
                                   &slot->audio_3d, &slot->audio_3d_min_distance, &slot->audio_3d_max_distance,
                                   &slot->audio_3d_rolloff, slot->audio_node, sizeof(slot->audio_node),
                                   slot->audio_effect, sizeof(slot->audio_effect));
+    load_sidecar_game_audio_mutes_a(slot->sidecar_path, &slot->game_audio_mutes);
     slot->audio_ready_tick = now + 3000;
     slot->playback_start_tick = 0;
     sidecar_ini_path_a(slot->sidecar_path, slot->sidecar_ini_path, sizeof(slot->sidecar_ini_path));
@@ -10779,6 +11091,7 @@ static video_gl_texture_t *remember_video_gl_texture(GLenum target, GLint level,
                                   &slot->audio_3d, &slot->audio_3d_min_distance, &slot->audio_3d_max_distance,
                                   &slot->audio_3d_rolloff, slot->audio_node, sizeof(slot->audio_node),
                                   slot->audio_effect, sizeof(slot->audio_effect));
+    load_sidecar_game_audio_mutes_a(slot->sidecar_path, &slot->game_audio_mutes);
     slot->audio_ready_tick = GetTickCount() + 3000;
     slot->playback_start_tick = 0;
     sidecar_ini_path_a(slot->sidecar_path, slot->sidecar_ini_path, sizeof(slot->sidecar_ini_path));
@@ -10971,6 +11284,7 @@ static void refresh_gl_texture_settings(video_gl_texture_t *vt, DWORD now)
                                   &audio_3d, &audio_3d_min_distance, &audio_3d_max_distance,
                                   &audio_3d_rolloff, audio_node, sizeof(audio_node),
                                   audio_effect, sizeof(audio_effect));
+    load_sidecar_game_audio_mutes_a(vt->sidecar_path, &vt->game_audio_mutes);
     if (vt->audio_graph) {
         audio_graph_release(vt->audio_graph);
         vt->audio_graph = NULL;
@@ -11058,6 +11372,7 @@ static void refresh_d3d8_texture_settings(video_d3d8_texture_t *vt, DWORD now)
                                   &audio_3d, &audio_3d_min_distance, &audio_3d_max_distance,
                                   &audio_3d_rolloff, audio_node, sizeof(audio_node),
                                   audio_effect, sizeof(audio_effect));
+    load_sidecar_game_audio_mutes_a(vt->sidecar_path, &vt->game_audio_mutes);
     if (vt->audio_graph) {
         audio_graph_release(vt->audio_graph);
         vt->audio_graph = NULL;
@@ -12235,6 +12550,7 @@ static BOOL WINAPI hook_SwapBuffers(HDC hdc)
         perf_start = webm_perf_counter();
     }
     update_video_test_texture();
+    game_audio_refresh_mutes();
     webm_perf_add(WEBM_PERF_GL_TOTAL, perf_start);
     if (performance_profile) webm_perf_report(now);
     return real_SwapBuffers ? real_SwapBuffers(hdc) : FALSE;
@@ -12609,6 +12925,7 @@ static HRESULT WINAPI hook_d3d8_Present(IDirect3DDevice8 *self, const RECT *src_
         perf_start = webm_perf_counter();
     }
     update_d3d8_video_textures();
+    game_audio_refresh_mutes();
     webm_perf_add(WEBM_PERF_D3D8_TOTAL, perf_start);
     if (performance_profile) webm_perf_report(now);
     d3d8_present_serial++;
@@ -12921,6 +13238,38 @@ static void patch_sound_device_create(void)
     }
 }
 
+static void patch_game_audio_source_lifecycle(void)
+{
+    HMODULE sys;
+    void *destroy_target;
+    resolve_engine_audio_symbols();
+    sys = GetModuleHandleA("ThriXXX010278-SYS.dll");
+    if (!sys || !engine_SoundSource_SetVolume || !engine_SoundSource_GetVolume) {
+        log_line("GameAudio hooks unavailable sys=%p set_volume=%p get_volume=%p",
+                 (void*)sys, (void*)engine_SoundSource_SetVolume,
+                 (void*)engine_SoundSource_GetVolume);
+        return;
+    }
+    destroy_target = (void*)real_SoundSource_Destroy;
+    if (!destroy_target) {
+        destroy_target = (void*)GetProcAddress(sys, "??1SoundSource_D@Bionic@@QAE@XZ");
+        real_SoundSource_Destroy = (sound_source_destroy_t)destroy_target;
+    }
+    if (!sound_source_destroy_inline_installed && destroy_target) {
+        if (install_inline_hook(destroy_target, (void*)hook_SoundSourceDestroy, 10,
+                                (void**)&tramp_SoundSource_Destroy)) {
+            sound_source_destroy_inline_installed = 1;
+            debug_line("GameAudio SoundSource destructor hook installed target=%p trampoline=%p",
+                       destroy_target, (void*)tramp_SoundSource_Destroy);
+        } else {
+            log_line("GameAudio SoundSource destructor hook install failed target=%p", destroy_target);
+        }
+    }
+    if (!destroy_target) {
+        log_line("GameAudio SoundSource destructor hook unavailable");
+    }
+}
+
 static void patch_configeditor_param_change(void)
 {
     HMODULE executable;
@@ -13189,6 +13538,7 @@ static void patch_all_modules(void)
         if (sys) {
             patch_storage_openstream();
             patch_sound_device_create();
+            patch_game_audio_source_lifecycle();
             real_StreamPipeFileRead = real_StreamPipeFileRead ? real_StreamPipeFileRead :
                 (stream_read_t)GetProcAddress(sys, "?Read@StreamPipeFile@Bionic@@UAEHPAXH@Z");
             real_StreamPipeFileCacheRead = real_StreamPipeFileCacheRead ? real_StreamPipeFileCacheRead :
@@ -13382,6 +13732,19 @@ static void write_default_config_if_missing(const char *path)
         "; The active DirectX device limit is applied automatically.\r\n"
         "anisotropy=4\r\n"
         "\r\n"
+        "; --- uv_mode (local sidecars only) ---\r\n"
+        "; Controls how plugin video is mapped onto the target model's UV area.\r\n"
+        "; Supported in both [NC-TK17-WebM] and [NC-TK17-WebM:Twitch].\r\n"
+        "; off          = preserve the model's original UV mapping (default)\r\n"
+        "; full_texture = stretch the detected UV rectangle across the entire video\r\n"
+        "; full_texture requires a uniquely detected simple four-corner plane. If the\r\n"
+        "; target is not a simple quad, the override is safely disabled for that sidecar.\r\n"
+        "; A Twitch value overrides the regular WebM value; otherwise Twitch inherits it.\r\n"
+        "; Works with OpenGL and DirectX. Any required resizing happens only in memory;\r\n"
+        "; the add-on's original image, scene, and UV data are never modified.\r\n"
+        "; Example in either supported sidecar section:\r\n"
+        "; uv_mode=full_texture\r\n"
+        "\r\n"
         "; --- texture_audio ---\r\n"
         "; Enables the embedded audio stream from WebM texture sidecars.\r\n"
         "; false/0 disables audio. true/1 enables audio.\r\n"
@@ -13441,6 +13804,19 @@ static void write_default_config_if_missing(const char *path)
         "; audio_node=\"pos:1.0,2.0,3.0\"\r\n"
         "; audio_parent_path=\"/Room01/TV\"\r\n"
         "; audio_parent_path=\"/Primary01/Tools/NcToy7/tool_group/CRT_TV\"\r\n"
+        "\r\n"
+        "; --- mute_game_audio (local sidecars only) ---\r\n"
+        "; Temporarily mutes one or more native TK17 sounds while this sidecar's\r\n"
+        "; WebM or Twitch video is actually displayed.\r\n"
+        "; Supported in both [NC-TK17-WebM] and [NC-TK17-WebM:Twitch].\r\n"
+        "; Separate multiple sound resources with commas. Matching is case-insensitive,\r\n"
+        "; and the .ogg extension is optional. Resource paths are also accepted.\r\n"
+        "; The sounds continue playing silently to preserve their timelines and their\r\n"
+        "; previous volumes are restored when the original TK17 texture returns.\r\n"
+        "; Examples:\r\n"
+        "; mute_game_audio=NcRoom4_TV\r\n"
+        "; mute_game_audio=NcRoom4_TV, NcRoom4_TV2\r\n"
+        "; mute_game_audio=Shared/Effect/NcRoom4_TV\r\n"
         "\r\n"
         "; --- debug_logging ---\r\n"
         "; Enables verbose plugin and FFmpeg HTTP/HLS diagnostics.\r\n"
@@ -13720,6 +14096,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         log_ready = 1;
         InitializeCriticalSection(&video_decoder_retire_lock);
         video_decoder_retire_lock_ready = 1;
+        InitializeCriticalSection(&game_audio_mute_lock);
+        game_audio_mute_lock_ready = 1;
         debug_line("NC-TK17-WebM.dll attached");
         load_config();
     } else if (reason == DLL_PROCESS_DETACH) {
@@ -13727,6 +14105,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
         video_decoder_drain_retired();
         video_decoder_retire_lock_ready = 0;
         DeleteCriticalSection(&video_decoder_retire_lock);
+        game_audio_mute_lock_ready = 0;
+        DeleteCriticalSection(&game_audio_mute_lock);
         log_ready = 0;
         DeleteCriticalSection(&log_lock);
     }
