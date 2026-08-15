@@ -13,6 +13,20 @@ Install the MSYS2 MinGW 32-bit toolchain, then run:
 
 The compiled DLL is written to `build\NC-TK17-WEBM.dll`.
 
+## Hook5 direct upload
+
+`directx_d3d11_upload=true` enables a guarded fast path when Hook5 is active.
+The plugin correlates a TK17 D3D8 video texture with Hook5's underlying D3D11
+texture and uploads the prepared video frame directly, avoiding Hook5's second
+copy during `UnlockRect`.
+
+The fast path is used only after an exact texture match and format validation,
+including the smaller runtime proxy used for oversized video textures. If
+Hook5 is absent, a match is ambiguous, or the texture format is unsupported,
+the plugin automatically retains the normal D3D8 upload. OpenGL playback is
+unchanged. `async_decoding=true` is required for the prepared-frame cache used
+by the direct path.
+
 ## Sidecar UV mapping
 
 Either `[NC-TK17-WebM]` or `[NC-TK17-WebM:Twitch]` may opt into full-video UV

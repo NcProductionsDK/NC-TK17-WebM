@@ -14,6 +14,9 @@
 #include <d3d11.h>
 #include <float.h>
 #include <math.h>
+#if defined(__GNUC__) && (defined(__i386__) || defined(_M_IX86))
+#include <emmintrin.h>
+#endif
 
 #include "webm_twitch.h"
 #include "webm_twitch_chat.h"
@@ -73,6 +76,10 @@ typedef HRESULT (WINAPI *d3d11_CreateDeviceAndSwapChain_t)(IDXGIAdapter *, D3D_D
 typedef HRESULT (WINAPI *d3d11_CreateDevice_t)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
                                                const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **,
                                                D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+typedef HRESULT (STDMETHODCALLTYPE *d3d11_CreateTexture2D_t)(ID3D11Device *,
+                                                             const D3D11_TEXTURE2D_DESC *,
+                                                             const D3D11_SUBRESOURCE_DATA *,
+                                                             ID3D11Texture2D **);
 
 typedef void *(__cdecl *CreateVideoDecoderByExtension_t)(const char *);
 typedef void *(__cdecl *CreateTexture2D_t)(void);
@@ -218,8 +225,30 @@ static d3d8_DrawPrimitiveUP_t real_d3d8_DrawPrimitiveUP;
 static d3d8_DrawIndexedPrimitiveUP_t real_d3d8_DrawIndexedPrimitiveUP;
 static d3d11_CreateDeviceAndSwapChain_t real_D3D11CreateDeviceAndSwapChain;
 static d3d11_CreateDevice_t real_D3D11CreateDevice;
+static d3d11_CreateTexture2D_t real_d3d11_CreateTexture2D;
 static ID3D11Device *captured_d3d11_device;
 static ID3D11DeviceContext *captured_d3d11_context;
+static unsigned int captured_d3d11_generation;
+typedef int (__cdecl *hook5_acquire_d3d11_runtime_t)(
+    unsigned int, void **, void **, unsigned int *);
+static hook5_acquire_d3d11_runtime_t hook5_acquire_d3d11_runtime;
+static unsigned int hook5_d3d11_generation;
+
+typedef struct {
+    int active;
+    DWORD thread_id;
+    UINT width;
+    UINT height;
+    ID3D11Texture2D *candidate;
+    int candidate_count;
+} d3d11_texture_capture_t;
+
+static d3d11_texture_capture_t d3d11_texture_capture;
+
+static void d3d11_texture_capture_begin(UINT width, UINT height);
+static ID3D11Texture2D *d3d11_texture_capture_finish(void);
+static void capture_d3d11_runtime(
+    ID3D11Device *device, ID3D11DeviceContext *context);
 
 static CreateVideoDecoderByExtension_t real_CreateVideoDecoderByExtension;
 static CreateTexture2D_t real_CreateTexture2D;
@@ -303,6 +332,7 @@ static char texture_audio_effect[32] = "none";
 static int debug_logging = 0;
 static int performance_profile = 0;
 static int async_decoding = 0;
+static int directx_d3d11_upload = 1;
 static char retired_sidecar_paths[8][MAX_PATH * 4];
 static DWORD retired_sidecar_until[8];
 static int config_loaded;
@@ -711,6 +741,7 @@ typedef struct {
     unsigned int async_d3d8_cache_ready_generation;
     BYTE *async_d3d8_cache[2];
     size_t async_d3d8_cache_capacity[2];
+    volatile LONG async_d3d8_cache_readers[2];
     int async_d3d8_cache_front;
     int async_d3d8_cache_ready;
     int async_d3d8_cache_ready_levels;
@@ -879,6 +910,7 @@ static int game_audio_mute_lock_ready;
 static game_audio_mute_source_t game_audio_mute_sources[WEBM_GAME_AUDIO_MUTE_MAX_SOURCES];
 static int game_audio_mute_source_count;
 static game_audio_mute_list_t game_audio_active_mutes;
+static DWORD game_audio_mute_last_enforce_tick;
 
 typedef struct {
     int active;
@@ -990,6 +1022,11 @@ typedef struct {
     int filter_log_filtering;
     int filter_log_anisotropy;
     ID3D11SamplerState *d3d11_sampler;
+    ID3D11Texture2D *d3d11_texture;
+    int d3d11_direct_upload_ready;
+    int d3d11_direct_upload_logged;
+    unsigned int d3d11_runtime_generation;
+    UINT d3d11_mip_levels;
     unsigned int d3d11_sampler_generation;
     int d3d11_sampler_filtering;
     int d3d11_sampler_anisotropy;
@@ -4310,6 +4347,91 @@ static void video_decoder_configure_d3d8_cache(video_decoder_t *dec, int width, 
     if (old_chat) webm_twitch_chat_release(old_chat);
 }
 
+/*
+ * LockRect commonly returns write-combined memory.  The normal CRT memcpy is
+ * correct, but on large video frames it can pollute the CPU caches and write
+ * that memory much more slowly than non-temporal stores.  Keep the optimized
+ * path local to texture uploads and retain memcpy for small copies and CPUs
+ * without SSE2.
+ */
+#if defined(__GNUC__) && (defined(__i386__) || defined(_M_IX86))
+__attribute__((target("sse2"), noinline))
+static void webm_copy_texture_bytes_sse2(void *destination, const void *source,
+                                         size_t bytes)
+{
+    BYTE *dst = (BYTE*)destination;
+    const BYTE *src = (const BYTE*)source;
+    size_t prefix = ((size_t)0 - (size_t)dst) & 15u;
+    if (prefix > bytes) prefix = bytes;
+    if (prefix) {
+        memcpy(dst, src, prefix);
+        dst += prefix;
+        src += prefix;
+        bytes -= prefix;
+    }
+    while (bytes >= 64u) {
+        __m128i a = _mm_loadu_si128((const __m128i*)(src + 0));
+        __m128i b = _mm_loadu_si128((const __m128i*)(src + 16));
+        __m128i c = _mm_loadu_si128((const __m128i*)(src + 32));
+        __m128i d = _mm_loadu_si128((const __m128i*)(src + 48));
+        _mm_stream_si128((__m128i*)(dst + 0), a);
+        _mm_stream_si128((__m128i*)(dst + 16), b);
+        _mm_stream_si128((__m128i*)(dst + 32), c);
+        _mm_stream_si128((__m128i*)(dst + 48), d);
+        dst += 64;
+        src += 64;
+        bytes -= 64;
+    }
+    while (bytes >= 16u) {
+        __m128i value = _mm_loadu_si128((const __m128i*)src);
+        _mm_stream_si128((__m128i*)dst, value);
+        dst += 16;
+        src += 16;
+        bytes -= 16;
+    }
+    _mm_sfence();
+    if (bytes) memcpy(dst, src, bytes);
+}
+#endif
+
+static void webm_copy_texture_bytes(void *destination, const void *source,
+                                    size_t bytes)
+{
+#if defined(__GNUC__) && (defined(__i386__) || defined(_M_IX86))
+    static volatile LONG sse2_state;
+    LONG state = InterlockedCompareExchange(&sse2_state, 0, 0);
+    if (!state) {
+#ifndef PF_XMMI64_INSTRUCTIONS_AVAILABLE
+#define PF_XMMI64_INSTRUCTIONS_AVAILABLE 10
+#endif
+        state = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) ? 2 : 1;
+        InterlockedCompareExchange(&sse2_state, state, 0);
+    }
+    if (state == 2 && bytes >= 262144u) {
+        webm_copy_texture_bytes_sse2(destination, source, bytes);
+        return;
+    }
+#endif
+    memcpy(destination, source, bytes);
+}
+
+static int video_decoder_wait_d3d8_cache_writable(video_decoder_t *dec,
+                                                    int buffer_index)
+{
+    int spins = 0;
+    if (!dec || buffer_index < 0 || buffer_index >= 2) return 0;
+    while (InterlockedCompareExchange(
+               &dec->async_d3d8_cache_readers[buffer_index], 0, 0) != 0) {
+        if (InterlockedCompareExchange(&dec->async_stop, 0, 0)) return 0;
+        if (spins++ < 8) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
+    }
+    return 1;
+}
+
 static int video_decoder_build_d3d8_cache(video_decoder_t *dec,
                                            d3d8_cache_build_t *build,
                                            const BYTE *source_frame,
@@ -4358,6 +4480,10 @@ static int video_decoder_build_d3d8_cache(video_decoder_t *dec,
         return 0;
     }
     build->buffer_index = front ? 0 : 1;
+    if (!video_decoder_wait_d3d8_cache_writable(dec, build->buffer_index)) {
+        if (chat) webm_twitch_chat_release(chat);
+        return 0;
+    }
     if (dec->async_d3d8_cache_capacity[build->buffer_index] < total_size) {
         BYTE *new_buffer = (BYTE*)realloc(dec->async_d3d8_cache[build->buffer_index], total_size);
         if (!new_buffer) {
@@ -4420,7 +4546,11 @@ static int video_decoder_copy_d3d8_cached_mip(video_decoder_t *dec, UINT level,
 {
     int y;
     int copied = 0;
+    int buffer_index = -1;
+    int source_pitch = 0;
     int bpp = d3d8_native_format_bpp(format);
+    BYTE *source = NULL;
+    size_t row_size = 0;
     if (!dec || !dec->async_enabled || !lr || !lr->pBits || bpp <= 0 || level >= WEBM_D3D8_CACHE_LEVELS) {
         return 0;
     }
@@ -4434,23 +4564,73 @@ static int video_decoder_copy_d3d8_cached_mip(video_decoder_t *dec, UINT level,
         dec->async_d3d8_cache_level_height[level] == height &&
         dec->async_d3d8_cache[dec->async_d3d8_cache_front] &&
         lr->Pitch >= width * bpp) {
-        BYTE *source = dec->async_d3d8_cache[dec->async_d3d8_cache_front] +
-                       dec->async_d3d8_cache_level_offset[level];
-        int source_pitch = dec->async_d3d8_cache_level_pitch[level];
-        size_t row_size = (size_t)width * (size_t)bpp;
-        if (lr->Pitch == source_pitch && source_pitch == (int)row_size) {
-            memcpy(lr->pBits, source, row_size * (size_t)height);
-            copied = 2;
-        } else {
-            for (y = 0; y < height; y++) {
-                memcpy((BYTE*)lr->pBits + (size_t)y * (size_t)lr->Pitch,
-                       source + (size_t)y * (size_t)source_pitch, row_size);
-            }
-            copied = 1;
-        }
+        buffer_index = dec->async_d3d8_cache_front;
+        source = dec->async_d3d8_cache[buffer_index] +
+                 dec->async_d3d8_cache_level_offset[level];
+        source_pitch = dec->async_d3d8_cache_level_pitch[level];
+        row_size = (size_t)width * (size_t)bpp;
+        InterlockedIncrement(&dec->async_d3d8_cache_readers[buffer_index]);
     }
     LeaveCriticalSection(&dec->async_frame_lock);
+
+    if (buffer_index < 0 || !source) return 0;
+    if (lr->Pitch == source_pitch && source_pitch == (int)row_size) {
+        webm_copy_texture_bytes(lr->pBits, source,
+                                row_size * (size_t)height);
+        copied = 2;
+    } else {
+        for (y = 0; y < height; y++) {
+            memcpy((BYTE*)lr->pBits + (size_t)y * (size_t)lr->Pitch,
+                   source + (size_t)y * (size_t)source_pitch, row_size);
+        }
+        copied = 1;
+    }
+    InterlockedDecrement(&dec->async_d3d8_cache_readers[buffer_index]);
     return copied;
+}
+
+typedef struct {
+    const BYTE *pixels;
+    int pitch;
+    int buffer_index;
+} d3d8_cached_mip_view_t;
+
+static int video_decoder_pin_d3d8_cached_mip(video_decoder_t *dec, UINT level,
+                                              int width, int height, int format,
+                                              d3d8_cached_mip_view_t *view)
+{
+    int buffer_index = -1;
+    if (!view) return 0;
+    memset(view, 0, sizeof(*view));
+    view->buffer_index = -1;
+    if (!dec || !dec->async_enabled || level >= WEBM_D3D8_CACHE_LEVELS) return 0;
+    EnterCriticalSection(&dec->async_frame_lock);
+    if (dec->async_d3d8_cache_ready &&
+        dec->async_d3d8_cache_ready_generation == dec->async_d3d8_cache_generation &&
+        dec->async_d3d8_cache_frame_index == dec->async_decoded_frame_index &&
+        dec->async_d3d8_cache_format == format &&
+        level < (UINT)dec->async_d3d8_cache_ready_levels &&
+        dec->async_d3d8_cache_level_width[level] == width &&
+        dec->async_d3d8_cache_level_height[level] == height &&
+        dec->async_d3d8_cache[dec->async_d3d8_cache_front]) {
+        buffer_index = dec->async_d3d8_cache_front;
+        InterlockedIncrement(&dec->async_d3d8_cache_readers[buffer_index]);
+        view->pixels = dec->async_d3d8_cache[buffer_index] +
+                       dec->async_d3d8_cache_level_offset[level];
+        view->pitch = dec->async_d3d8_cache_level_pitch[level];
+        view->buffer_index = buffer_index;
+    }
+    LeaveCriticalSection(&dec->async_frame_lock);
+    return view->pixels != NULL;
+}
+
+static void video_decoder_unpin_d3d8_cached_mip(video_decoder_t *dec,
+                                                 d3d8_cached_mip_view_t *view)
+{
+    if (!dec || !view || view->buffer_index < 0 || view->buffer_index >= 2) return;
+    InterlockedDecrement(&dec->async_d3d8_cache_readers[view->buffer_index]);
+    memset(view, 0, sizeof(*view));
+    view->buffer_index = -1;
 }
 
 static void video_decoder_async_publish_frame(video_decoder_t *dec, long frame_index)
@@ -10504,14 +10684,18 @@ static int game_audio_source_should_mute(const game_audio_mute_source_t *source,
 static void game_audio_set_source_muted(game_audio_mute_source_t *entry, int mute)
 {
     if (!entry || !entry->source || !engine_SoundSource_SetVolume) return;
-    if (mute && !entry->muted) {
-        entry->saved_volume = engine_SoundSource_GetVolume ?
-            engine_SoundSource_GetVolume(entry->source) : 1.0f;
-        engine_SoundSource_SetVolume(entry->source, WEBM_GAME_AUDIO_SILENT_VOLUME, 1);
-        entry->muted = 1;
-        debug_line("GameAudio muted source=\"%s\" volume=%.3f", entry->full_name, entry->saved_volume);
+    if (mute) {
+        if (!entry->muted) {
+            entry->saved_volume = engine_SoundSource_GetVolume ?
+                engine_SoundSource_GetVolume(entry->source) : 1.0f;
+            entry->muted = 1;
+            debug_line("GameAudio muted source=\"%s\" volume=%.3f", entry->full_name, entry->saved_volume);
+        }
+        /* Apply an absolute volume. Room scripts may set their source volume
+           again after creation, so active mutes are periodically reinforced. */
+        engine_SoundSource_SetVolume(entry->source, WEBM_GAME_AUDIO_SILENT_VOLUME, 0);
     } else if (!mute && entry->muted) {
-        engine_SoundSource_SetVolume(entry->source, entry->saved_volume, 1);
+        engine_SoundSource_SetVolume(entry->source, entry->saved_volume, 0);
         entry->muted = 0;
         debug_line("GameAudio restored source=\"%s\" volume=%.3f", entry->full_name, entry->saved_volume);
     }
@@ -10622,16 +10806,26 @@ static void game_audio_collect_active_mutes(game_audio_mute_list_t *active)
 static void game_audio_refresh_mutes(void)
 {
     game_audio_mute_list_t active;
+    DWORD now;
+    int changed;
+    int enforce;
     int i;
     if (!game_audio_mute_lock_ready) return;
     game_audio_collect_active_mutes(&active);
+    now = GetTickCount();
     EnterCriticalSection(&game_audio_mute_lock);
-    if (memcmp(&active, &game_audio_active_mutes, sizeof(active)) != 0) {
+    changed = memcmp(&active, &game_audio_active_mutes, sizeof(active)) != 0;
+    enforce = changed || !game_audio_mute_last_enforce_tick ||
+              (DWORD)(now - game_audio_mute_last_enforce_tick) >= 250u;
+    if (changed) {
         game_audio_active_mutes = active;
+    }
+    if (enforce) {
         for (i = 0; i < game_audio_mute_source_count; i++) {
             game_audio_set_source_muted(&game_audio_mute_sources[i],
                 game_audio_source_should_mute(&game_audio_mute_sources[i], &game_audio_active_mutes));
         }
+        game_audio_mute_last_enforce_tick = now;
     }
     LeaveCriticalSection(&game_audio_mute_lock);
 }
@@ -10704,6 +10898,10 @@ static void clear_d3d8_texture_slot(video_d3d8_texture_t *slot)
         ID3D11SamplerState_Release(slot->d3d11_sampler);
         slot->d3d11_sampler = NULL;
     }
+    if (slot->d3d11_texture) {
+        ID3D11Texture2D_Release(slot->d3d11_texture);
+        slot->d3d11_texture = NULL;
+    }
     memset(slot, 0, sizeof(*slot));
     if (video_texture) IDirect3DTexture8_Release(video_texture);
     if (texture) IDirect3DTexture8_Release(texture);
@@ -10718,11 +10916,30 @@ static void clear_all_d3d8_texture_slots(void)
     d3d8_last_global_update_tick = 0;
 }
 
+static int d3d11_upload_format_matches(D3DFORMAT d3d8_format, DXGI_FORMAT dxgi_format)
+{
+    if (d3d8_format == D3DFMT_A8R8G8B8) {
+        return dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+               dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    }
+    if (d3d8_format == D3DFMT_X8R8G8B8) {
+        return dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM ||
+               dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+    }
+    if (d3d8_format == D3DFMT_R5G6B5) {
+        return dxgi_format == DXGI_FORMAT_B5G6R5_UNORM;
+    }
+    return 0;
+}
+
 static void remember_d3d8_texture(IDirect3DDevice8 *device, IDirect3DTexture8 *texture, UINT width, UINT height,
-                                  UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool)
+                                  UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                                  ID3D11Texture2D *d3d11_candidate)
 {
     video_d3d8_texture_t *slot;
     IDirect3DTexture8 *video_texture = NULL;
+    ID3D11Texture2D *proxy_d3d11_candidate = NULL;
+    ID3D11Texture2D *upload_d3d11_candidate = d3d11_candidate;
     DWORD now = GetTickCount();
     int uv_mode_base = WEBM_UV_MODE_OFF;
     int uv_mode_twitch = WEBM_UV_MODE_OFF;
@@ -10763,20 +10980,29 @@ static void remember_d3d8_texture(IDirect3DDevice8 *device, IDirect3DTexture8 *t
                      texture, width, height, target_texture_sidecar_path);
             return;
         }
+        d3d11_texture_capture_begin((UINT)upload_width, (UINT)upload_height);
         proxy_hr = real_d3d8_CreateTexture ?
             real_d3d8_CreateTexture(device, (UINT)upload_width, (UINT)upload_height, 0, 0,
                                     format, D3DPOOL_MANAGED, &video_texture) : D3DERR_INVALIDCALL;
+        proxy_d3d11_candidate = d3d11_texture_capture_finish();
         if (FAILED(proxy_hr) || !video_texture) {
+            if (proxy_d3d11_candidate) ID3D11Texture2D_Release(proxy_d3d11_candidate);
             log_line("D3D8Texture proxy creation failed source=%ux%u proxy=%dx%d format=%d hr=0x%08lx sidecar=\"%s\"",
                      width, height, upload_width, upload_height, (int)format,
                      (unsigned long)proxy_hr, target_texture_sidecar_path);
             return;
         }
+        if (directx_d3d11_upload && captured_d3d11_context && !proxy_d3d11_candidate) {
+            log_line("D3D11 direct upload proxy match unavailable source=%ux%u proxy=%dx%d fallback=D3D8 sidecar=\"%s\"",
+                     width, height, upload_width, upload_height, target_texture_sidecar_path);
+        }
+        upload_d3d11_candidate = proxy_d3d11_candidate;
         log_line("D3D8Texture runtime proxy source=%ux%u proxy=%dx%d sidecar=\"%s\"",
                  width, height, upload_width, upload_height, target_texture_sidecar_path);
     }
     slot = find_d3d8_texture_slot(texture);
     if (!slot) {
+        if (proxy_d3d11_candidate) ID3D11Texture2D_Release(proxy_d3d11_candidate);
         if (video_texture) IDirect3DTexture8_Release(video_texture);
         return;
     }
@@ -10793,6 +11019,34 @@ static void remember_d3d8_texture(IDirect3DDevice8 *device, IDirect3DTexture8 *t
     slot->usage = video_texture ? 0 : usage;
     slot->format = format;
     slot->pool = video_texture ? D3DPOOL_MANAGED : pool;
+    if (directx_d3d11_upload && upload_d3d11_candidate && captured_d3d11_context) {
+        D3D11_TEXTURE2D_DESC desc;
+        memset(&desc, 0, sizeof(desc));
+        ID3D11Texture2D_GetDesc(upload_d3d11_candidate, &desc);
+        if (desc.Width == (UINT)slot->width && desc.Height == (UINT)slot->height &&
+            desc.ArraySize == 1 && desc.SampleDesc.Count == 1 &&
+            desc.Usage == D3D11_USAGE_DEFAULT && desc.CPUAccessFlags == 0 &&
+            (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 &&
+            d3d11_upload_format_matches(format, desc.Format)) {
+            ID3D11Texture2D_AddRef(upload_d3d11_candidate);
+            slot->d3d11_texture = upload_d3d11_candidate;
+            slot->d3d11_direct_upload_ready = 1;
+            slot->d3d11_runtime_generation = captured_d3d11_generation;
+            slot->d3d11_mip_levels = desc.MipLevels;
+            log_line("D3D11 direct upload matched d3d8=%p d3d11=%p size=%ux%u mips=%u format=%d sidecar=\"%s\"",
+                     video_texture ? video_texture : texture, upload_d3d11_candidate,
+                     desc.Width, desc.Height, desc.MipLevels,
+                     (int)desc.Format, target_texture_sidecar_path);
+        } else {
+            debug_line("D3D11 direct upload rejected d3d8=%p d3d11=%p size=%ux%u expected=%dx%d mips=%u usage=%d bind=0x%08lx cpu=0x%08lx samples=%u format=%d d3d8_format=%d",
+                       video_texture ? video_texture : texture, upload_d3d11_candidate,
+                       desc.Width, desc.Height,
+                       slot->width, slot->height, desc.MipLevels, (int)desc.Usage,
+                       (unsigned long)desc.BindFlags, (unsigned long)desc.CPUAccessFlags,
+                       desc.SampleDesc.Count, (int)desc.Format, (int)format);
+        }
+    }
+    if (proxy_d3d11_candidate) ID3D11Texture2D_Release(proxy_d3d11_candidate);
     slot->first_seen_tick = now;
     slot->last_bound_tick = slot->first_seen_tick;
     slot->last_bound_present_serial = d3d8_present_serial;
@@ -11962,6 +12216,35 @@ static void update_d3d8_video_textures(void)
             }
             if (level_width < 1) level_width = 1;
             if (level_height < 1) level_height = 1;
+            if (directx_d3d11_upload && vt->d3d11_direct_upload_ready &&
+                vt->d3d11_texture && captured_d3d11_context &&
+                vt->d3d11_runtime_generation == captured_d3d11_generation &&
+                (vt->d3d11_mip_levels == 0 || level < vt->d3d11_mip_levels)) {
+                d3d8_cached_mip_view_t cached_view;
+                if (video_decoder_pin_d3d8_cached_mip(vt->decoder, level,
+                                                       level_width, level_height,
+                                                       vt->format, &cached_view)) {
+                    LONGLONG upload_start = webm_perf_counter();
+                    ID3D11DeviceContext_UpdateSubresource(
+                        captured_d3d11_context, (ID3D11Resource*)vt->d3d11_texture,
+                        level, NULL, cached_view.pixels, (UINT)cached_view.pitch,
+                        (UINT)((size_t)cached_view.pitch * (size_t)level_height));
+                    video_decoder_unpin_d3d8_cached_mip(vt->decoder, &cached_view);
+                    webm_perf_add(WEBM_PERF_D3D8_UPLOAD, upload_start);
+                    if (!vt->d3d11_direct_upload_logged) {
+                        vt->d3d11_direct_upload_logged = 1;
+                        log_line("D3D11 direct upload active d3d8=%p d3d11=%p sidecar=\"%s\"",
+                                 upload_texture, vt->d3d11_texture, vt->sidecar_path);
+                    }
+                    if (performance_profile) {
+                        webm_perf_state.uploaded_d3d8_mips++;
+                        webm_perf_state.cached_d3d8_mips++;
+                        webm_perf_state.contiguous_d3d8_mips++;
+                    }
+                    uploaded_any = 1;
+                    continue;
+                }
+            }
             lock_start = webm_perf_counter();
             lock_hr = IDirect3DTexture8_LockRect(upload_texture, level, &lr, NULL, 0);
             webm_perf_add(WEBM_PERF_D3D8_LOCK, lock_start);
@@ -12556,15 +12839,110 @@ static BOOL WINAPI hook_SwapBuffers(HDC hdc)
     return real_SwapBuffers ? real_SwapBuffers(hdc) : FALSE;
 }
 
+static int capture_hook5_d3d11_runtime(void)
+{
+    HMODULE hook5_extended;
+    ID3D11Device *device = NULL;
+    ID3D11DeviceContext *context = NULL;
+    unsigned int generation = 0;
+    FARPROC address;
+
+    if (!directx_d3d11_upload) return 0;
+    if (!hook5_acquire_d3d11_runtime) {
+        hook5_extended = GetModuleHandleA("NC-TK17-Hook5-Extended.dll");
+        if (!hook5_extended) return 0;
+        address = GetProcAddress(
+            hook5_extended, "nc_hook5_extended_acquire_d3d11_runtime");
+        if (!address) return 0;
+        memcpy(&hook5_acquire_d3d11_runtime, &address, sizeof(address));
+    }
+    if (!hook5_acquire_d3d11_runtime(
+            1u, (void **)&device, (void **)&context, &generation))
+        return 0;
+    if (!device || !context) {
+        if (context) ID3D11DeviceContext_Release(context);
+        if (device) ID3D11Device_Release(device);
+        return 0;
+    }
+    if (generation != hook5_d3d11_generation ||
+        device != captured_d3d11_device ||
+        context != captured_d3d11_context) {
+        capture_d3d11_runtime(device, context);
+        hook5_d3d11_generation = generation;
+        log_line("D3D11 runtime acquired from Hook5 Extended generation=%u device=%p context=%p",
+                 generation, device, context);
+    }
+    ID3D11DeviceContext_Release(context);
+    ID3D11Device_Release(device);
+    return captured_d3d11_device && captured_d3d11_context;
+}
+
+static void d3d11_texture_capture_begin(UINT width, UINT height)
+{
+    if (d3d11_texture_capture.candidate) {
+        ID3D11Texture2D_Release(d3d11_texture_capture.candidate);
+    }
+    memset(&d3d11_texture_capture, 0, sizeof(d3d11_texture_capture));
+    capture_hook5_d3d11_runtime();
+    if (!directx_d3d11_upload || !captured_d3d11_device ||
+        !target_texture_probe_path[0] || width == 0 || height == 0) return;
+    d3d11_texture_capture.active = 1;
+    d3d11_texture_capture.thread_id = GetCurrentThreadId();
+    d3d11_texture_capture.width = width;
+    d3d11_texture_capture.height = height;
+}
+
+static ID3D11Texture2D *d3d11_texture_capture_finish(void)
+{
+    ID3D11Texture2D *candidate = NULL;
+    if (d3d11_texture_capture.candidate_count == 1) {
+        candidate = d3d11_texture_capture.candidate;
+        d3d11_texture_capture.candidate = NULL;
+    } else if (d3d11_texture_capture.candidate) {
+        ID3D11Texture2D_Release(d3d11_texture_capture.candidate);
+        d3d11_texture_capture.candidate = NULL;
+    }
+    memset(&d3d11_texture_capture, 0, sizeof(d3d11_texture_capture));
+    return candidate;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_d3d11_CreateTexture2D(
+    ID3D11Device *self, const D3D11_TEXTURE2D_DESC *desc,
+    const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture)
+{
+    HRESULT hr = real_d3d11_CreateTexture2D ?
+        real_d3d11_CreateTexture2D(self, desc, initial_data, texture) : E_FAIL;
+    if (SUCCEEDED(hr) && texture && *texture && desc &&
+        d3d11_texture_capture.active &&
+        d3d11_texture_capture.thread_id == GetCurrentThreadId() &&
+        desc->Width == d3d11_texture_capture.width &&
+        desc->Height == d3d11_texture_capture.height &&
+        desc->ArraySize == 1 && desc->SampleDesc.Count == 1 &&
+        desc->Usage == D3D11_USAGE_DEFAULT && desc->CPUAccessFlags == 0 &&
+        (desc->BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0) {
+        d3d11_texture_capture.candidate_count++;
+        if (d3d11_texture_capture.candidate_count == 1) {
+            ID3D11Texture2D_AddRef(*texture);
+            d3d11_texture_capture.candidate = *texture;
+        }
+    }
+    return hr;
+}
+
 static HRESULT WINAPI hook_d3d8_CreateTexture(IDirect3DDevice8 *self, UINT width, UINT height, UINT levels,
                                               DWORD usage, D3DFORMAT format, D3DPOOL pool,
                                               IDirect3DTexture8 **texture)
 {
     HRESULT hr;
+    ID3D11Texture2D *d3d11_candidate;
+    d3d11_texture_capture_begin(width, height);
     hr = real_d3d8_CreateTexture ? real_d3d8_CreateTexture(self, width, height, levels, usage, format, pool, texture) : D3DERR_INVALIDCALL;
+    d3d11_candidate = d3d11_texture_capture_finish();
     if (SUCCEEDED(hr) && texture && *texture) {
-        remember_d3d8_texture(self, *texture, width, height, levels, usage, format, pool);
+        remember_d3d8_texture(self, *texture, width, height, levels, usage, format, pool,
+                              d3d11_candidate);
     }
+    if (d3d11_candidate) ID3D11Texture2D_Release(d3d11_candidate);
     return hr;
 }
 
@@ -12610,6 +12988,8 @@ static void clear_d3d11_filter_overrides(int restore)
 static void capture_d3d11_runtime(ID3D11Device *device, ID3D11DeviceContext *context)
 {
     if (!device || !context) return;
+    patch_vtable_slot(device, 5, (void*)hook_d3d11_CreateTexture2D,
+                      (void**)&real_d3d11_CreateTexture2D);
     if (captured_d3d11_device == device && captured_d3d11_context == context) return;
     clear_d3d11_filter_overrides(1);
     if (captured_d3d11_context) ID3D11DeviceContext_Release(captured_d3d11_context);
@@ -12618,6 +12998,8 @@ static void capture_d3d11_runtime(ID3D11Device *device, ID3D11DeviceContext *con
     ID3D11DeviceContext_AddRef(context);
     captured_d3d11_device = device;
     captured_d3d11_context = context;
+    captured_d3d11_generation++;
+    if (!captured_d3d11_generation) captured_d3d11_generation = 1;
     debug_line("D3D11 runtime captured device=%p context=%p", device, context);
 }
 
@@ -13716,6 +14098,13 @@ static void write_default_config_if_missing(const char *path)
         "; 0 = all mip levels, most visible, most expensive\r\n"
         "directx_mip_levels=5\r\n"
         "\r\n"
+        "; --- directx_d3d11_upload ---\r\n"
+        "; Uses Hook5's validated D3D11 backing texture directly, avoiding the duplicate\r\n"
+        "; D3D8 LockRect/UnlockRect upload. Automatically falls back when Hook5 is absent,\r\n"
+        "; the texture cannot be matched exactly, or the format is unsupported.\r\n"
+        "; OpenGL playback is unaffected.\r\n"
+        "directx_d3d11_upload=true\r\n"
+        "\r\n"
         "; --- video_filtering ---\r\n"
         "; Texture sampling mode. A local sidecar can override this per video.\r\n"
         "; nearest = sharp pixels and lowest sampling cost\r\n"
@@ -13932,6 +14321,8 @@ static void load_config_values(int log_enabled)
         d3d8_mip_levels = profile_key_bool_a(path, "NC-TK17-WebM", "directx_update_mips", 1) ? 8 : 1;
     }
     d3d8_mip_levels = clamp_int(d3d8_mip_levels, 0, 8);
+    directx_d3d11_upload = profile_key_bool_a(
+        path, "NC-TK17-WebM", "directx_d3d11_upload", directx_d3d11_upload);
     GetPrivateProfileStringA("NC-TK17-WebM", "video_filtering", "linear",
                              filtering_value, sizeof(filtering_value), path);
     video_filtering = parse_video_filtering_a(filtering_value, VIDEO_FILTER_LINEAR);
@@ -14012,9 +14403,10 @@ static void load_config_values(int log_enabled)
     get_file_write_time_a(path, &config_write_time);
     if (log_enabled) {
         log_line("NC-TK17-WebM config loaded");
-        debug_line("config texture_fps=%d interval_ms=%lu max_texture=%dx%d directx_mip_levels=%d video_filtering=%s anisotropy=%d texture_audio=%d texture_audio_engine=%d audio_lead_ms=%d audio_volume=%d texture_audio_3d=%d audio_3d_distance=%d-%d audio_3d_rolloff=%d audio_effect=\"%s\" debug_logging=%d performance_profile=%d async_decoding=%d",
+        debug_line("config texture_fps=%d interval_ms=%lu max_texture=%dx%d directx_mip_levels=%d directx_d3d11_upload=%d video_filtering=%s anisotropy=%d texture_audio=%d texture_audio_engine=%d audio_lead_ms=%d audio_volume=%d texture_audio_3d=%d audio_3d_distance=%d-%d audio_3d_rolloff=%d audio_effect=\"%s\" debug_logging=%d performance_profile=%d async_decoding=%d",
                    texture_video_fps, (unsigned long)texture_video_interval_ms,
                    texture_max_width, texture_max_height, d3d8_mip_levels,
+                   directx_d3d11_upload,
                    video_filtering_name(video_filtering), video_anisotropy,
                    texture_audio_enabled, texture_audio_engine_enabled,
                    texture_audio_lead_ms, texture_audio_volume,
