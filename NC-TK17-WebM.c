@@ -5,6 +5,7 @@
 #include <objbase.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -232,7 +233,16 @@ static unsigned int captured_d3d11_generation;
 typedef int (__cdecl *hook5_acquire_d3d11_runtime_t)(
     unsigned int, void **, void **, unsigned int *);
 static hook5_acquire_d3d11_runtime_t hook5_acquire_d3d11_runtime;
+typedef int (__cdecl *hook5_begin_texture_resource_alias_t)(
+    unsigned int, void *, void *);
+typedef int (__cdecl *hook5_restore_texture_resource_aliases_t)(unsigned int);
+static hook5_begin_texture_resource_alias_t
+    hook5_begin_texture_resource_alias;
+static hook5_restore_texture_resource_aliases_t
+    hook5_restore_texture_resource_aliases;
 static unsigned int hook5_d3d11_generation;
+static DWORD hook5_resource_alias_bridge_last_lookup_tick;
+static int hook5_resource_aliases_active;
 
 typedef struct {
     int active;
@@ -573,6 +583,8 @@ typedef void *(*av_malloc_t)(size_t);
 typedef void (*av_free_t)(void *);
 typedef int (*av_opt_get_int_t)(void *, const char *, int, long long *);
 typedef void (*av_log_set_level_t)(int);
+typedef void (__cdecl *av_log_callback_t)(void *, int, const char *, va_list);
+typedef void (*av_log_set_callback_t)(av_log_callback_t);
 typedef SwsContext *(*sws_getContext_t)(int, int, int, int, int, int, int, void *, void *, const double *);
 typedef int (*sws_scale_t)(SwsContext *, const unsigned char * const [], const int [], int, int, unsigned char * const [], const int []);
 typedef void (*sws_freeContext_t)(SwsContext *);
@@ -618,12 +630,28 @@ typedef struct {
     av_free_t av_free;
     av_opt_get_int_t av_opt_get_int;
     av_log_set_level_t av_log_set_level;
+    av_log_callback_t av_log_default_callback;
+    av_log_set_callback_t av_log_set_callback;
     sws_getContext_t sws_getContext;
     sws_scale_t sws_scale;
     sws_freeContext_t sws_freeContext;
 } ffmpeg_api_t;
 
 static ffmpeg_api_t ffmpeg_api;
+
+static void __cdecl webm_ffmpeg_log_callback(void *avcl, int level,
+                                              const char *format, va_list args)
+{
+    /* Some live MP4 streams repeat a valid MOOV atom as they refresh. FFmpeg
+       safely skips it, but emits this warning for every refresh. Keep every
+       other FFmpeg diagnostic on its normal path. */
+    if (format && strstr(format, "Found duplicated MOOV Atom. Skipped it") != NULL) {
+        return;
+    }
+    if (ffmpeg_api.av_log_default_callback) {
+        ffmpeg_api.av_log_default_callback(avcl, level, format, args);
+    }
+}
 
 #define VM_AV_NOPTS_VALUE (-9223372036854775807LL - 1)
 #define VM_AV_LOG_WARNING 24
@@ -865,6 +893,7 @@ static void engine_audio_player_release(engine_audio_player_t *ep);
 static void engine_audio_player_update(engine_audio_player_t *ep, DWORD now);
 static int remux_webm_audio_to_ogg_a(const char *webm, char *sound_id, size_t sound_id_sz, char *cache_path, size_t cache_path_sz);
 static void clear_all_video_texture_slots(void);
+static void restore_hook5_proxy_resource_aliases(void);
 
 typedef struct {
     int parked;
@@ -1017,6 +1046,7 @@ typedef struct {
     float uv_max_u;
     float uv_max_v;
     int uv_override_logged;
+    int hook5_resource_alias_logged;
     game_audio_mute_list_t game_audio_mutes;
     unsigned int filter_log_generation;
     int filter_log_filtering;
@@ -5014,6 +5044,13 @@ static int ffmpeg_load_api(void)
     LOAD_FF(av_free, avutil);
     ffmpeg_api.av_opt_get_int = (av_opt_get_int_t)GetProcAddress(ffmpeg_api.avutil, "av_opt_get_int");
     ffmpeg_api.av_log_set_level = (av_log_set_level_t)GetProcAddress(ffmpeg_api.avutil, "av_log_set_level");
+    ffmpeg_api.av_log_default_callback =
+        (av_log_callback_t)GetProcAddress(ffmpeg_api.avutil, "av_log_default_callback");
+    ffmpeg_api.av_log_set_callback =
+        (av_log_set_callback_t)GetProcAddress(ffmpeg_api.avutil, "av_log_set_callback");
+    if (ffmpeg_api.av_log_set_callback && ffmpeg_api.av_log_default_callback) {
+        ffmpeg_api.av_log_set_callback(webm_ffmpeg_log_callback);
+    }
     if (ffmpeg_api.av_log_set_level) {
         ffmpeg_api.av_log_set_level(debug_logging ? VM_AV_LOG_INFO : VM_AV_LOG_WARNING);
     }
@@ -10852,6 +10889,7 @@ static void clear_d3d8_texture_slot(video_d3d8_texture_t *slot)
     int mip_level;
     int stage;
     if (!slot) return;
+    if (slot->video_texture) restore_hook5_proxy_resource_aliases();
     twitch_override_auto_release_sidecar_a(slot->sidecar_ini_path);
     for (stage = 0; stage < 8; stage++) {
         if (d3d8_bound_video_slots[stage] == slot) {
@@ -12877,6 +12915,60 @@ static int capture_hook5_d3d11_runtime(void)
     return captured_d3d11_device && captured_d3d11_context;
 }
 
+static int resolve_hook5_resource_alias_bridge(void)
+{
+    HMODULE hook5_extended;
+    FARPROC begin_address;
+    FARPROC restore_address;
+    DWORD now;
+    if (hook5_begin_texture_resource_alias &&
+        hook5_restore_texture_resource_aliases)
+        return 1;
+    now = GetTickCount();
+    if (hook5_resource_alias_bridge_last_lookup_tick &&
+        (now - hook5_resource_alias_bridge_last_lookup_tick) < 5000u)
+        return 0;
+    hook5_resource_alias_bridge_last_lookup_tick = now ? now : 1u;
+    hook5_extended = GetModuleHandleA("NC-TK17-Hook5-Extended.dll");
+    if (!hook5_extended) return 0;
+    begin_address = GetProcAddress(
+        hook5_extended, "nc_hook5_extended_begin_texture_resource_alias");
+    restore_address = GetProcAddress(
+        hook5_extended, "nc_hook5_extended_restore_texture_resource_aliases");
+    if (!begin_address || !restore_address) return 0;
+    memcpy(&hook5_begin_texture_resource_alias,
+           &begin_address, sizeof(begin_address));
+    memcpy(&hook5_restore_texture_resource_aliases,
+           &restore_address, sizeof(restore_address));
+    return 1;
+}
+
+static int begin_hook5_proxy_resource_alias(video_d3d8_texture_t *vt)
+{
+    if (!vt || !vt->texture || !vt->video_texture ||
+        !resolve_hook5_resource_alias_bridge())
+        return 0;
+    if (!hook5_begin_texture_resource_alias(
+            1u, (void *)vt->texture, (void *)vt->video_texture))
+        return 0;
+    hook5_resource_aliases_active = 1;
+    if (!vt->hook5_resource_alias_logged) {
+        log_line("Hook5 pass preserved by D3D8 video resource alias source=%p proxy=%p sidecar=\"%s\"",
+                 vt->texture, vt->video_texture, vt->sidecar_path);
+        vt->hook5_resource_alias_logged = 1;
+    }
+    return 1;
+}
+
+static void restore_hook5_proxy_resource_aliases(void)
+{
+    if (!hook5_resource_aliases_active ||
+        !hook5_restore_texture_resource_aliases)
+        return;
+    hook5_restore_texture_resource_aliases(1u);
+    hook5_resource_aliases_active = 0;
+}
+
 static void d3d11_texture_capture_begin(UINT width, UINT height)
 {
     if (d3d11_texture_capture.candidate) {
@@ -13183,18 +13275,22 @@ static void begin_d3d8_uv_overrides(IDirect3DDevice8 *device, d3d8_uv_override_s
             continue;
         }
         if (vt->video_texture) {
-            if (!real_d3d8_SetTexture ||
-                FAILED(real_d3d8_SetTexture(device, stage,
-                                             (IDirect3DBaseTexture8*)vt->video_texture))) {
-                IDirect3DDevice8_SetTextureStageState(device, stage,
-                                                      D3DTSS_TEXTURETRANSFORMFLAGS,
-                                                      state->transform_flags[stage]);
-                IDirect3DDevice8_SetTransform(device,
-                                              (D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + stage),
-                                              &state->transform[stage]);
-                continue;
+            if (!begin_hook5_proxy_resource_alias(vt)) {
+                if (!real_d3d8_SetTexture ||
+                    FAILED(real_d3d8_SetTexture(
+                        device, stage,
+                        (IDirect3DBaseTexture8*)vt->video_texture))) {
+                    IDirect3DDevice8_SetTextureStageState(
+                        device, stage, D3DTSS_TEXTURETRANSFORMFLAGS,
+                        state->transform_flags[stage]);
+                    IDirect3DDevice8_SetTransform(
+                        device,
+                        (D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + stage),
+                        &state->transform[stage]);
+                    continue;
+                }
+                state->texture_replaced[stage] = 1;
             }
-            state->texture_replaced[stage] = 1;
         }
         state->active[stage] = 1;
         if (!vt->uv_override_logged) {
@@ -13300,6 +13396,7 @@ static HRESULT WINAPI hook_d3d8_Present(IDirect3DDevice8 *self, const RECT *src_
 {
     DWORD now = GetTickCount();
     LONGLONG perf_start = 0;
+    HRESULT hr;
     flush_twitch_chat_opacity(now);
     flush_twitch_chat_width(now);
     if (performance_profile) {
@@ -13311,12 +13408,20 @@ static HRESULT WINAPI hook_d3d8_Present(IDirect3DDevice8 *self, const RECT *src_
     webm_perf_add(WEBM_PERF_D3D8_TOTAL, perf_start);
     if (performance_profile) webm_perf_report(now);
     d3d8_present_serial++;
-    return real_d3d8_Present ? real_d3d8_Present(self, src_rect, dst_rect, dst_window_override, dirty_region) : D3DERR_INVALIDCALL;
+    hr = real_d3d8_Present ?
+        real_d3d8_Present(self, src_rect, dst_rect,
+                          dst_window_override, dirty_region) :
+        D3DERR_INVALIDCALL;
+    restore_hook5_proxy_resource_aliases();
+    return hr;
 }
 
 static HRESULT WINAPI hook_d3d8_EndScene(IDirect3DDevice8 *self)
 {
-    return real_d3d8_EndScene ? real_d3d8_EndScene(self) : D3DERR_INVALIDCALL;
+    HRESULT hr = real_d3d8_EndScene ?
+        real_d3d8_EndScene(self) : D3DERR_INVALIDCALL;
+    restore_hook5_proxy_resource_aliases();
+    return hr;
 }
 
 static HRESULT WINAPI hook_d3d8_CreateDevice(IDirect3D8 *self, UINT adapter, D3DDEVTYPE device_type,
@@ -13329,6 +13434,7 @@ static HRESULT WINAPI hook_d3d8_CreateDevice(IDirect3D8 *self, UINT adapter, D3D
                                                          behavior_flags, presentation_parameters,
                                                          returned_device) : D3DERR_INVALIDCALL;
     if (SUCCEEDED(hr) && returned_device && *returned_device) {
+        restore_hook5_proxy_resource_aliases();
         clear_d3d11_filter_overrides(1);
         clear_all_d3d8_texture_slots();
         memset(d3d8_bound_textures, 0, sizeof(d3d8_bound_textures));
@@ -13384,6 +13490,7 @@ static void patch_d3d8_device(IDirect3DDevice8 *dev)
 {
     patch_vtable_slot(dev, 15, hook_d3d8_Present, (void**)&real_d3d8_Present);
     patch_vtable_slot(dev, 20, hook_d3d8_CreateTexture, (void**)&real_d3d8_CreateTexture);
+    patch_vtable_slot(dev, 35, hook_d3d8_EndScene, (void**)&real_d3d8_EndScene);
     patch_vtable_slot(dev, 61, hook_d3d8_SetTexture, (void**)&real_d3d8_SetTexture);
     patch_vtable_slot(dev, 70, hook_d3d8_DrawPrimitive, (void**)&real_d3d8_DrawPrimitive);
     patch_vtable_slot(dev, 71, hook_d3d8_DrawIndexedPrimitive, (void**)&real_d3d8_DrawIndexedPrimitive);

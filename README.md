@@ -27,6 +27,22 @@ the plugin automatically retains the normal D3D8 upload. OpenGL playback is
 unchanged. `async_decoding=true` is required for the prepared-frame cache used
 by the direct path.
 
+When an oversized texture uses that runtime proxy, WebM asks
+NC-TK17-Hook5-Extended to keep the original Hook5 texture bound while
+temporarily redirecting only its D3D11 shader-resource view to the video
+proxy. Hook5 therefore retains the original texture's complete `_pass.txt`
+identity, auxiliary stages, and values such as `glow_intensity`. The borrowed
+view is reference-counted and restored immediately after Hook5's deferred
+EndScene render. If Hook5 Extended or its guarded bridge is unavailable, WebM
+keeps its previous proxy behavior.
+
+## FFmpeg diagnostics
+
+FFmpeg warnings and errors remain visible, except for its harmless repeated
+`Found duplicated MOOV Atom` warning. Some live MP4 streams periodically
+repeat valid metadata; FFmpeg already skips it safely, so WebM suppresses only
+that exact message to prevent console-log spam.
+
 ## Sidecar UV mapping
 
 Either `[NC-TK17-WebM]` or `[NC-TK17-WebM:Twitch]` may opt into full-video UV
