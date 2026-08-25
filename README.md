@@ -43,6 +43,15 @@ FFmpeg warnings and errors remain visible, except for its harmless repeated
 repeat valid metadata; FFmpeg already skips it safely, so WebM suppresses only
 that exact message to prevent console-log spam.
 
+## Twitch override offline fallback
+
+The in-game Twitch override stores `channel_offline_fallback=fallback` or
+`channel_offline_fallback=random` in `[NC-TK17-WebM:TwitchOverride]`.
+`fallback` uses the regular WebM when available, otherwise TK17's original
+texture. `random` reuses the existing Twitch discovery path when the configured
+channel is unavailable. While a random stream is playing, the plugin continues
+checking the configured channel and switches back when it becomes live.
+
 ## Sidecar UV mapping
 
 Either `[NC-TK17-WebM]` or `[NC-TK17-WebM:Twitch]` may opt into full-video UV

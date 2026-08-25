@@ -356,6 +356,7 @@ static char twitch_override_target[MAX_PATH * 4];
 static char twitch_override_auto_room[MAX_PATH];
 static char twitch_override_auto_target[MAX_PATH * 4];
 static char twitch_override_channel[WEBM_TWITCH_CHANNEL_LIST_MAX];
+static int twitch_override_channel_offline_random;
 static char twitch_override_quality[WEBM_TWITCH_QUALITY_MAX];
 static int twitch_override_chat_enabled;
 static int twitch_override_chat_position = 1;
@@ -2001,6 +2002,14 @@ static void THISCALL hook_ConfigEditor_ParamChange(void *self, const char *param
                                       has_value && override_value_is_enabled_a(value_text) ? "1" : "0");
     } else if (strcmp(parameter_text, "NCWebMOverrideTarget") == 0) {
         if (has_value) write_twitch_override_value_a("target", value_text);
+    } else if (strcmp(parameter_text,
+                      "NCWebMTwitchOverrideChannelOfflineFallback") == 0) {
+        if (has_value && (_stricmp(value_text, "fallback") == 0 ||
+                          _stricmp(value_text, "random") == 0)) {
+            write_twitch_override_value_a(
+                "channel_offline_fallback",
+                _stricmp(value_text, "random") == 0 ? "random" : "fallback");
+        }
     } else if (strcmp(parameter_text, "NCWebMTwitchOverrideQuality") == 0) {
         if (has_value && value_text[0]) {
             write_twitch_override_value_a("quality", value_text);
@@ -5771,7 +5780,9 @@ static webm_twitch_session_t *create_twitch_session_a(const char *sidecar_ini,
     forced_override = twitch_override_matches_sidecar_a(sidecar_ini);
     if (forced_override) {
         settings->enabled = 1;
-        settings->random_enabled = 0;
+        /* Reuse the sidecar resolver's existing fixed-channel-first random
+           fallback and preferred-channel recovery behavior. */
+        settings->random_enabled = twitch_override_channel_offline_random;
         settings->fallback_enabled = 1;
         lstrcpynA(settings->channel, twitch_override_channel, sizeof(settings->channel));
         if (twitch_override_quality[0]) {
@@ -14386,6 +14397,9 @@ static void write_default_config_if_missing(const char *path)
         "enabled=0\r\n"
         "target=\r\n"
         "channel=\r\n"
+        "; When the configured channel is unavailable: fallback or random.\r\n"
+        "; random reuses Twitch discovery, then periodically checks the configured channel.\r\n"
+        "channel_offline_fallback=fallback\r\n"
         "; Maximum stream quality. Preset fallback lists only select lower renditions.\r\n"
         "quality=720p60,720p,480p,360p,worst\r\n"
         "chat_enabled=false\r\n"
@@ -14465,6 +14479,10 @@ static void load_config_values(int log_enabled)
     }
     GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", "channel", "",
                              twitch_override_channel, sizeof(twitch_override_channel), path);
+    GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", "channel_offline_fallback",
+                             "fallback", override_value, sizeof(override_value), path);
+    twitch_override_channel_offline_random =
+        _stricmp(override_value, "random") == 0 ? 1 : 0;
     GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", "quality",
                              "720p60,720p,480p,360p,worst",
                              twitch_override_quality, sizeof(twitch_override_quality), path);
@@ -14520,10 +14538,12 @@ static void load_config_values(int log_enabled)
                    texture_audio_3d_enabled, texture_audio_3d_min_distance,
                    texture_audio_3d_max_distance, texture_audio_3d_rolloff,
                    texture_audio_effect, debug_logging, performance_profile, async_decoding);
-        debug_line("Twitch override enabled=%d target=\"%s\" auto_room=\"%s\" auto_target=\"%s\" channel=\"%s\" quality=\"%s\" chat=%d position=%s overlay=%d animated_emotes=%d width=%.3f opacity=%.3f",
+        debug_line("Twitch override enabled=%d target=\"%s\" auto_room=\"%s\" auto_target=\"%s\" channel=\"%s\" offline_fallback=%s quality=\"%s\" chat=%d position=%s overlay=%d animated_emotes=%d width=%.3f opacity=%.3f",
                    twitch_override_enabled, twitch_override_target,
                    twitch_override_auto_room, twitch_override_auto_target,
-                   twitch_override_channel, twitch_override_quality,
+                   twitch_override_channel,
+                   twitch_override_channel_offline_random ? "random" : "fallback",
+                   twitch_override_quality,
                    twitch_override_chat_enabled,
                    twitch_override_chat_position == 0 ? "left" : "right",
                    twitch_override_chat_overlay,
