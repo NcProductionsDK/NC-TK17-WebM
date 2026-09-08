@@ -1,0 +1,2 @@
+- The video or audio for Twitch streams gets desynced after watching for a long period of time. Case: When starting the twitch stream in TK17, the video and audio are synced but starts to get slowly more desynced through time.
+- <s>CcConfigEditorWebm.lua's sliders and spinboxes needs to be synced with the config ini file like how Nc-TK17-Liquids does it</s>

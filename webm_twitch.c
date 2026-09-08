@@ -571,7 +571,7 @@ static int resolve_channel_stream(webm_twitch_session_t *session,
         quality[sizeof(quality) - 1] = 0;
     }
     if (!find_streamlink(executable, sizeof(executable))) {
-        copy_string(error, error_size, "Streamlink was not found in Binaries\\NC-TK17-WebM-twitch");
+        copy_string(error, error_size, "Streamlink was not found in Extensions\\WebM\\NC-TK17-WebM-twitch");
         return 0;
     }
     copy_string(helper_dir, sizeof(helper_dir), executable);

@@ -146,7 +146,10 @@ typedef int (THISCALL *widget_dispatch_event_t)(void *, DWORD, DWORD);
 typedef int (THISCALL *script_get_i32_t)(void *, DWORD);
 typedef void (THISCALL *script_get_string_t)(void *, DWORD, char **);
 typedef void (THISCALL *engine_string_release_t)(char **);
+typedef void (THISCALL *engine_string_construct_cstr_t)(char **, const char *);
 typedef float (THISCALL *widget_get_float_t)(void *, DWORD);
+typedef void (THISCALL *widget_set_float_t)(void *, DWORD, float);
+typedef void (THISCALL *widget_set_string_t)(void *, DWORD, const char *);
 typedef void *(__cdecl *storage_openstream_t)(char *, unsigned int, char *);
 typedef void *(__cdecl *bionic_new_t)(unsigned int, int);
 typedef void *(__cdecl *msvc_new_t)(unsigned int);
@@ -161,6 +164,7 @@ typedef void (__cdecl *al_sourcefv_t)(unsigned int, int, const float *);
 typedef void (__cdecl *al_source_queue_buffers_t)(unsigned int, int, const unsigned int *);
 typedef void (__cdecl *al_source_unqueue_buffers_t)(unsigned int, int, unsigned int *);
 typedef void (__cdecl *al_get_sourcei_t)(unsigned int, int, int *);
+typedef void (__cdecl *al_get_sourcef_t)(unsigned int, int, float *);
 typedef void (__cdecl *al_gen_buffers_t)(int, unsigned int *);
 typedef void (__cdecl *al_delete_buffers_t)(int, const unsigned int *);
 typedef void (__cdecl *al_buffer_data_t)(unsigned int, int, const void *, int, int);
@@ -177,6 +181,7 @@ typedef void *(__cdecl *alc_get_current_context_t)(void);
 #define AL_PLAYING_ 0x1012
 #define AL_BUFFERS_QUEUED_ 0x1015
 #define AL_BUFFERS_PROCESSED_ 0x1016
+#define AL_SEC_OFFSET_ 0x1024
 #define AL_REFERENCE_DISTANCE_ 0x1020
 #define AL_ROLLOFF_FACTOR_ 0x1021
 #define AL_MAX_DISTANCE_ 0x1023
@@ -385,6 +390,33 @@ static void *twitch_chat_width_slider_widget;
 static float twitch_chat_width_pending_value;
 static DWORD twitch_chat_width_pending_tick;
 static int twitch_chat_width_pending;
+static int webm_setting_sync_depth;
+
+typedef enum webm_setting_control_type_t {
+    WEBM_SETTING_SPINBOX,
+    WEBM_SETTING_SLIDER
+} webm_setting_control_type_t;
+
+typedef struct webm_setting_binding_t {
+    const char *param_name;
+    const char *key;
+    webm_setting_control_type_t type;
+    void *slider_widget;
+} webm_setting_binding_t;
+
+static webm_setting_binding_t webm_setting_bindings[] = {
+    { "NCWebMOverrideEnabled", "enabled", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMOverrideTarget", "target", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChannelOfflineFallback", "channel_offline_fallback", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChatEnabled", "chat_enabled", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChatPosition", "chat_position", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChatOverlay", "chat_overlay", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChatAnimatedEmotesEnabled", "chat_animated_emotes", WEBM_SETTING_SPINBOX, NULL },
+    { "NCWebMTwitchOverrideChatOverlayOpacity", "chat_background_opacity", WEBM_SETTING_SLIDER, NULL },
+    { "NCWebMTwitchOverrideChatContainerWidth", "chat_width", WEBM_SETTING_SLIDER, NULL },
+    { "NCWebMTwitchOverrideQuality", "quality", WEBM_SETTING_SPINBOX, NULL }
+};
+
 static int twitch_channel_dialog_active;
 static DWORD twitch_channel_dialog_last_tick;
 static app_find_objc_t engine_FindObjC;
@@ -436,6 +468,7 @@ static al_sourcefv_t vm_alSourcefv;
 static al_source_queue_buffers_t vm_alSourceQueueBuffers;
 static al_source_unqueue_buffers_t vm_alSourceUnqueueBuffers;
 static al_get_sourcei_t vm_alGetSourcei;
+static al_get_sourcef_t vm_alGetSourcef;
 static al_gen_buffers_t vm_alGenBuffers;
 static al_delete_buffers_t vm_alDeleteBuffers;
 static al_buffer_data_t vm_alBufferData;
@@ -732,6 +765,9 @@ typedef struct {
     int first_frame_pts_set;
     int network_source;
     DWORD live_buffer_ms;
+    double live_audio_clock_ms;
+    double live_audio_clock_offset_ms;
+    int live_audio_clock_valid;
     webm_live_frame_t live_queue[WEBM_LIVE_QUEUE_CAPACITY];
     int live_queue_head;
     int live_queue_count;
@@ -867,6 +903,11 @@ typedef struct {
     unsigned int twitch_sync_dropped_chunks;
     double twitch_start_pts_ms;
     int twitch_start_pts_set;
+    unsigned int twitch_queue_order[WEBM_TWITCH_OPENAL_BUFFERS];
+    int twitch_queue_head;
+    int twitch_queue_count;
+    double twitch_buffer_pts_ms[WEBM_TWITCH_OPENAL_BUFFERS];
+    double twitch_buffer_duration_ms[WEBM_TWITCH_OPENAL_BUFFERS];
     BYTE *twitch_pcm;
     size_t twitch_pcm_capacity;
     char source_name[128];
@@ -1246,6 +1287,9 @@ static int guid_equal(REFGUID a, REFGUID b);
 static void guid_to_text(REFGUID g, char *out, size_t outsz);
 static void dirname_inplace(char *path);
 static void path_join(char *out, size_t outsz, const char *a, const char *b);
+static int webm_extension_root_a(char *out, size_t outsz);
+static void webm_component_dir_a(char *out, size_t outsz,
+                                 const char *component_name);
 static void cache_root_a(char *out, size_t outsz);
 static int webm_alias_to_real_w(LPCWSTR alias, wchar_t *real, size_t real_count);
 static int ends_with_i(const char *s, const char *suffix);
@@ -1277,6 +1321,7 @@ static int clamp_int(int value, int min_value, int max_value);
 static void load_config(void);
 static void refresh_global_config(DWORD now);
 static void reload_global_config_now(void);
+static int slider_widget_value(void *slider, float *out_value);
 static void THISCALL hook_ConfigEditor_ParamChange(void *self, const char *parameter,
                                                    const char *value, DWORD arg3, DWORD arg4);
 static void flush_twitch_chat_opacity(DWORD now);
@@ -1530,6 +1575,18 @@ static int ptr_readable(const void *p, size_t bytes)
     return (const BYTE*)p + bytes <= (const BYTE*)mbi.BaseAddress + mbi.RegionSize;
 }
 
+static int ptr_executable(const void *p)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD protect;
+    if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return 0;
+    protect = mbi.Protect & 0xff;
+    return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
 static int copy_engine_string_a(const char *value, char *out, size_t outsz)
 {
     int length;
@@ -1717,6 +1774,179 @@ static int widget_text_value(void *widget, char *out, size_t outsz)
     return copied;
 }
 
+static webm_setting_binding_t *webm_setting_binding_by_name(const char *name)
+{
+    size_t index;
+    if (!name) return NULL;
+    for (index = 0;
+         index < sizeof(webm_setting_bindings) / sizeof(webm_setting_bindings[0]);
+         ++index) {
+        if (strcmp(webm_setting_bindings[index].param_name, name) == 0)
+            return &webm_setting_bindings[index];
+    }
+    return NULL;
+}
+
+static int widget_text_set_value(void *widget, const char *value)
+{
+    HMODULE executable;
+    BYTE *base;
+    BYTE *metadata;
+    BYTE *dispatch_table;
+    engine_string_construct_cstr_t construct_string;
+    engine_string_release_t release_string;
+    widget_set_string_t setter;
+    char *engine_value = NULL;
+    const DWORD member_id = 0x04fff0eb;
+    if (!widget || !value ||
+        !ptr_readable((BYTE*)widget - 0x18, sizeof(metadata))) return 0;
+    executable = GetModuleHandleA(NULL);
+    if (!executable) return 0;
+    base = (BYTE*)executable;
+    if (!ptr_readable(base + 0x0024a9e4, sizeof(construct_string)) ||
+        !ptr_readable(base + 0x0024a9e8, sizeof(release_string))) return 0;
+    memcpy(&metadata, (BYTE*)widget - 0x18, sizeof(metadata));
+    if (!metadata ||
+        !ptr_readable(metadata + (member_id & 0x0fff) * sizeof(void*),
+                      sizeof(dispatch_table))) return 0;
+    memcpy(&dispatch_table,
+           metadata + (member_id & 0x0fff) * sizeof(void*),
+           sizeof(dispatch_table));
+    if (!dispatch_table ||
+        !ptr_readable(dispatch_table + 0x104, sizeof(setter))) return 0;
+    memcpy(&setter, dispatch_table + 0x104, sizeof(setter));
+    memcpy(&construct_string, base + 0x0024a9e4, sizeof(construct_string));
+    memcpy(&release_string, base + 0x0024a9e8, sizeof(release_string));
+    if (!ptr_executable((const void*)setter) ||
+        !ptr_executable((const void*)construct_string) ||
+        !ptr_executable((const void*)release_string)) return 0;
+    construct_string(&engine_value, value);
+    if (!engine_value) return 0;
+    setter(widget, member_id, engine_value);
+    release_string(&engine_value);
+    return 1;
+}
+
+static int slider_widget_set_value(void *slider, float value)
+{
+    BYTE *metadata;
+    BYTE *dispatch_table;
+    widget_set_float_t setter;
+    if (!slider || !_finite(value) ||
+        !ptr_readable((BYTE*)slider - 0x18, sizeof(metadata))) return 0;
+    memcpy(&metadata, (BYTE*)slider - 0x18, sizeof(metadata));
+    if (!metadata || !ptr_readable(metadata + 0x3b4, sizeof(dispatch_table)))
+        return 0;
+    memcpy(&dispatch_table, metadata + 0x3b4, sizeof(dispatch_table));
+    if (!dispatch_table ||
+        !ptr_readable(dispatch_table + 0x84, sizeof(setter))) return 0;
+    memcpy(&setter, dispatch_table + 0x84, sizeof(setter));
+    if (!ptr_executable((const void*)setter)) return 0;
+    setter(slider, 0x02fff0ed, value);
+    return 1;
+}
+
+static int webm_setting_ini_spinbox_value(
+    const webm_setting_binding_t *binding, char *out, size_t outsz)
+{
+    if (!binding || !out || !outsz || binding->type != WEBM_SETTING_SPINBOX)
+        return 0;
+    load_config();
+    out[0] = 0;
+    if (!config_path_global[0] ||
+        !GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", binding->key,
+                                  "", out, (DWORD)outsz,
+                                  config_path_global) || !out[0]) return 0;
+    if (strcmp(binding->key, "enabled") == 0 ||
+        strcmp(binding->key, "chat_enabled") == 0) {
+        lstrcpynA(out, override_value_is_enabled_a(out) ? "ON" : "OFF",
+                  (int)outsz);
+    } else if (strcmp(binding->key, "chat_overlay") == 0 ||
+               strcmp(binding->key, "chat_animated_emotes") == 0) {
+        lstrcpynA(out, override_value_is_enabled_a(out) ? "true" : "false",
+                  (int)outsz);
+    } else if (strcmp(binding->key, "channel_offline_fallback") == 0) {
+        lstrcpynA(out, _stricmp(out, "random") == 0 ? "random" : "fallback",
+                  (int)outsz);
+    } else if (strcmp(binding->key, "chat_position") == 0) {
+        lstrcpynA(out, _stricmp(out, "left") == 0 ? "left" : "right",
+                  (int)outsz);
+    }
+    return 1;
+}
+
+static void webm_sync_spinbox_from_ini(
+    const webm_setting_binding_t *binding, void *widget)
+{
+    char requested[MAX_PATH * 4];
+    char current[MAX_PATH * 4];
+    if (!binding || !widget ||
+        !webm_setting_ini_spinbox_value(binding, requested,
+                                         sizeof(requested))) return;
+    if (widget_text_value(widget, current, sizeof(current)) &&
+        strcmp(current, requested) == 0) return;
+    webm_setting_sync_depth++;
+    if (!widget_text_set_value(widget, requested)) {
+        webm_setting_sync_depth--;
+        log_line("ConfigEditor spinbox sync failed param=\"%s\" requested=\"%s\"",
+                 binding->param_name, requested);
+        return;
+    }
+    webm_setting_sync_depth--;
+    debug_line("ConfigEditor spinbox synced param=\"%s\" ini=\"%s\"",
+               binding->param_name, requested);
+}
+
+static int webm_setting_ini_slider_value(
+    const webm_setting_binding_t *binding, float *out_value)
+{
+    char text[64];
+    char *end = NULL;
+    double parsed;
+    if (!binding || !out_value || binding->type != WEBM_SETTING_SLIDER)
+        return 0;
+    load_config();
+    text[0] = 0;
+    if (!config_path_global[0] ||
+        !GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", binding->key,
+                                  "", text, sizeof(text),
+                                  config_path_global) || !text[0]) return 0;
+    parsed = strtod(text, &end);
+    if (end == text || !_finite(parsed)) return 0;
+    while (*end && isspace((unsigned char)*end)) ++end;
+    if (*end) return 0;
+    if (strcmp(binding->key, "chat_width") == 0) {
+        if (parsed < 0.20) parsed = 0.20;
+        if (parsed > 0.60) parsed = 0.60;
+    } else {
+        if (parsed < 0.10) parsed = 0.10;
+        if (parsed > 1.0) parsed = 1.0;
+    }
+    *out_value = (float)parsed;
+    return 1;
+}
+
+static void webm_sync_slider_from_ini(webm_setting_binding_t *binding,
+                                       void *slider)
+{
+    float requested;
+    float current;
+    if (!binding || !slider ||
+        !webm_setting_ini_slider_value(binding, &requested)) return;
+    if (slider_widget_value(slider, &current) &&
+        fabsf(current - requested) <= 0.00001f) return;
+    webm_setting_sync_depth++;
+    if (!slider_widget_set_value(slider, requested)) {
+        webm_setting_sync_depth--;
+        log_line("ConfigEditor slider sync failed param=\"%s\" requested=%.6g",
+                 binding->param_name, requested);
+        return;
+    }
+    webm_setting_sync_depth--;
+    debug_line("ConfigEditor slider synced param=\"%s\" ini=%.6g",
+               binding->param_name, requested);
+}
+
 static void trim_ascii_inplace(char *value)
 {
     char *start;
@@ -1774,18 +2004,22 @@ static int THISCALL hook_Customizer_BuildControls(void *self, void *arg1,
         char parameter_name[128];
         void *record = records[i];
         void *widget = NULL;
+        webm_setting_binding_t *binding;
         if (!parameters[i] || !record ||
             !custom_parameter_name(parameters[i], parameter_name, sizeof(parameter_name)) ||
-            strcmp(parameter_name, "NCWebMTwitchOverrideChannelInput") != 0 ||
             !ptr_readable((BYTE*)record + 0x24, sizeof(widget))) {
             continue;
         }
         memcpy(&widget, (BYTE*)record + 0x24, sizeof(widget));
-        if (widget) {
+        if (!widget) continue;
+        if (strcmp(parameter_name, "NCWebMTwitchOverrideChannelInput") == 0) {
             twitch_channel_text_widget = widget;
             debug_line("ConfigEditor Twitch channel text connected widget=%p", widget);
+            continue;
         }
-        break;
+        binding = webm_setting_binding_by_name(parameter_name);
+        if (binding && binding->type == WEBM_SETTING_SPINBOX)
+            webm_sync_spinbox_from_ini(binding, widget);
     }
     return result;
 }
@@ -1947,15 +2181,16 @@ static int THISCALL hook_Customizer_CreateSlider(void *self, void *parameter,
     int result;
     char parameter_name[128];
     void *slider = NULL;
+    webm_setting_binding_t *binding;
     result = tramp_Customizer_CreateSlider ?
         tramp_Customizer_CreateSlider(self, parameter, record, parent, y,
                                       preset_index, has_labels) : 0;
-    if (!custom_parameter_name(parameter, parameter_name, sizeof(parameter_name)) ||
-        (strcmp(parameter_name, "NCWebMTwitchOverrideChatOverlayOpacity") != 0 &&
-         strcmp(parameter_name, "NCWebMTwitchOverrideChatContainerWidth") != 0) ||
-        !record) {
+    if (!custom_parameter_name(parameter, parameter_name,
+                               sizeof(parameter_name)) || !record) {
         return result;
     }
+    binding = webm_setting_binding_by_name(parameter_name);
+    if (!binding || binding->type != WEBM_SETTING_SLIDER) return result;
     if (preset_index < 0) {
         if (ptr_readable((BYTE*)record + 0x04, sizeof(slider))) {
             memcpy(&slider, (BYTE*)record + 0x04, sizeof(slider));
@@ -1967,6 +2202,7 @@ static int THISCALL hook_Customizer_CreateSlider(void *self, void *parameter,
                sizeof(slider));
     }
     if (slider) {
+        binding->slider_widget = slider;
         if (strcmp(parameter_name, "NCWebMTwitchOverrideChatOverlayOpacity") == 0) {
             twitch_chat_opacity_slider_widget = slider;
             debug_line("ConfigEditor Twitch chat opacity slider connected widget=%p",
@@ -1975,6 +2211,13 @@ static int THISCALL hook_Customizer_CreateSlider(void *self, void *parameter,
             twitch_chat_width_slider_widget = slider;
             debug_line("ConfigEditor Twitch chat width slider connected widget=%p",
                        slider);
+        }
+        if (preset_index < 0) {
+            webm_sync_slider_from_ini(binding, slider);
+            if (strcmp(binding->key, "chat_background_opacity") == 0)
+                twitch_chat_opacity_pending = 0;
+            else
+                twitch_chat_width_pending = 0;
         }
     } else {
         debug_line("ConfigEditor Twitch chat slider unavailable parameter=\"%s\" record=%p preset=%d",
@@ -1995,7 +2238,7 @@ static void THISCALL hook_ConfigEditor_ParamChange(void *self, const char *param
     if (tramp_ConfigEditor_ParamChange) {
         tramp_ConfigEditor_ParamChange(self, parameter, value, arg3, arg4);
     }
-    if (!has_parameter) return;
+    if (!has_parameter || webm_setting_sync_depth) return;
 
     if (strcmp(parameter_text, "NCWebMOverrideEnabled") == 0) {
         write_twitch_override_value_a("enabled",
@@ -2200,8 +2443,6 @@ static HRESULT WINAPI hook_graph_RenderFile(void *self, LPCWSTR file, LPCWSTR pl
 static HRESULT create_lav_source_filter_for_file(LPCWSTR file, void **filter_out)
 {
     wchar_t real_path[MAX_PATH * 4];
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
     char lav_dir[MAX_PATH * 2];
     char splitter_path[MAX_PATH * 2];
     char file_mb[MAX_PATH * 4];
@@ -2225,14 +2466,12 @@ static HRESULT create_lav_source_filter_for_file(LPCWSTR file, void **filter_out
     }
 
     wide_to_mb(real_path, file_mb, sizeof(file_mb));
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) {
-        log_line("LAV source create failed: cannot locate NC-TK17-WebM.dll");
+    webm_component_dir_a(lav_dir, sizeof(lav_dir),
+                         "NC-TK17-WebM-lav");
+    if (!lav_dir[0]) {
+        log_line("LAV source create failed: cannot locate Extensions\\WebM");
         return E_FAIL;
     }
-    dll_path[sizeof(dll_path) - 1] = '\0';
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(lav_dir, sizeof(lav_dir), bin_dir, "NC-TK17-WebM-lav");
     path_join(splitter_path, sizeof(splitter_path), lav_dir, "LAVSplitter.ax");
 
     SetDllDirectoryA(lav_dir);
@@ -2288,8 +2527,6 @@ static HRESULT create_lav_source_filter_for_file(LPCWSTR file, void **filter_out
 
 static HRESULT create_lav_filter_object(const char *ax_name, REFGUID clsid, void **filter_out)
 {
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
     char lav_dir[MAX_PATH * 2];
     char ax_path[MAX_PATH * 2];
     HMODULE mod;
@@ -2302,14 +2539,12 @@ static HRESULT create_lav_filter_object(const char *ax_name, REFGUID clsid, void
     if (filter_out) *filter_out = NULL;
     if (!filter_out || !ax_name || !clsid) return E_INVALIDARG;
 
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) {
-        log_line("LAV filter create failed: cannot locate NC-TK17-WebM.dll");
+    webm_component_dir_a(lav_dir, sizeof(lav_dir),
+                         "NC-TK17-WebM-lav");
+    if (!lav_dir[0]) {
+        log_line("LAV filter create failed: cannot locate Extensions\\WebM");
         return E_FAIL;
     }
-    dll_path[sizeof(dll_path) - 1] = '\0';
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(lav_dir, sizeof(lav_dir), bin_dir, "NC-TK17-WebM-lav");
     path_join(ax_path, sizeof(ax_path), lav_dir, ax_name);
 
     SetDllDirectoryA(lav_dir);
@@ -2895,6 +3130,7 @@ static int openal_resolve_symbols(void)
     vm_alSourceQueueBuffers = (al_source_queue_buffers_t)GetProcAddress(al, "alSourceQueueBuffers");
     vm_alSourceUnqueueBuffers = (al_source_unqueue_buffers_t)GetProcAddress(al, "alSourceUnqueueBuffers");
     vm_alGetSourcei = (al_get_sourcei_t)GetProcAddress(al, "alGetSourcei");
+    vm_alGetSourcef = (al_get_sourcef_t)GetProcAddress(al, "alGetSourcef");
     vm_alGenBuffers = (al_gen_buffers_t)GetProcAddress(al, "alGenBuffers");
     vm_alDeleteBuffers = (al_delete_buffers_t)GetProcAddress(al, "alDeleteBuffers");
     vm_alBufferData = (al_buffer_data_t)GetProcAddress(al, "alBufferData");
@@ -3156,6 +3392,81 @@ static audio_graph_t *audio_graph_create_twitch_stream(const char *path, int vol
     return ag;
 }
 
+static int twitch_audio_buffer_index(const audio_graph_t *ag,
+                                     unsigned int buffer)
+{
+    int index;
+    if (!ag || !buffer) return -1;
+    for (index = 0; index < ag->twitch_buffer_count; ++index) {
+        if (ag->twitch_buffers[index] == buffer) return index;
+    }
+    return -1;
+}
+
+static void twitch_audio_queue_track(audio_graph_t *ag, unsigned int buffer,
+                                     double pts_ms, double duration_ms)
+{
+    int buffer_index;
+    int queue_index;
+    if (!ag || !buffer ||
+        ag->twitch_queue_count >= WEBM_TWITCH_OPENAL_BUFFERS) return;
+    buffer_index = twitch_audio_buffer_index(ag, buffer);
+    if (buffer_index < 0) return;
+    ag->twitch_buffer_pts_ms[buffer_index] = pts_ms;
+    ag->twitch_buffer_duration_ms[buffer_index] = duration_ms;
+    queue_index = (ag->twitch_queue_head + ag->twitch_queue_count) %
+                  WEBM_TWITCH_OPENAL_BUFFERS;
+    ag->twitch_queue_order[queue_index] = buffer;
+    ag->twitch_queue_count++;
+}
+
+static void twitch_audio_queue_untrack(audio_graph_t *ag,
+                                       unsigned int buffer)
+{
+    int offset;
+    int found = -1;
+    if (!ag || !buffer || ag->twitch_queue_count <= 0) return;
+    for (offset = 0; offset < ag->twitch_queue_count; ++offset) {
+        int index = (ag->twitch_queue_head + offset) %
+                    WEBM_TWITCH_OPENAL_BUFFERS;
+        if (ag->twitch_queue_order[index] == buffer) {
+            found = offset;
+            break;
+        }
+    }
+    if (found < 0) return;
+    for (offset = found; offset + 1 < ag->twitch_queue_count; ++offset) {
+        int destination = (ag->twitch_queue_head + offset) %
+                          WEBM_TWITCH_OPENAL_BUFFERS;
+        int source = (ag->twitch_queue_head + offset + 1) %
+                     WEBM_TWITCH_OPENAL_BUFFERS;
+        ag->twitch_queue_order[destination] =
+            ag->twitch_queue_order[source];
+    }
+    ag->twitch_queue_count--;
+}
+
+static int twitch_audio_playback_clock(const audio_graph_t *ag,
+                                       double *out_pts_ms)
+{
+    unsigned int buffer;
+    int buffer_index;
+    float seconds = 0.0f;
+    double offset_ms;
+    if (!ag || !out_pts_ms || !vm_alGetSourcef ||
+        ag->twitch_queue_count <= 0) return 0;
+    buffer = ag->twitch_queue_order[ag->twitch_queue_head];
+    buffer_index = twitch_audio_buffer_index(ag, buffer);
+    if (buffer_index < 0) return 0;
+    vm_alGetSourcef(ag->al_source, AL_SEC_OFFSET_, &seconds);
+    if (!_finite(seconds) || seconds < 0.0f) seconds = 0.0f;
+    offset_ms = (double)seconds * 1000.0;
+    if (offset_ms > ag->twitch_buffer_duration_ms[buffer_index])
+        offset_ms = ag->twitch_buffer_duration_ms[buffer_index];
+    *out_pts_ms = ag->twitch_buffer_pts_ms[buffer_index] + offset_ms;
+    return 1;
+}
+
 static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t *dec,
                                              DWORD target_ms)
 {
@@ -3166,6 +3477,8 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
     int playback_clock_ready;
     double desired_pts_ms;
     double chunk_end_ms;
+    double duration_ms;
+    double playback_pts_ms;
     int bytes;
     int samples;
     int sample_rate;
@@ -3178,11 +3491,15 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
         return;
     }
     audio_graph_update_3d(ag, GetTickCount());
+    if (!ag->twitch_started) dec->live_audio_clock_valid = 0;
     vm_alGetSourcei(ag->al_source, AL_BUFFERS_PROCESSED_, &processed);
     while (processed-- > 0 && ag->twitch_free_count < ag->twitch_buffer_count) {
         buffer = 0;
         vm_alSourceUnqueueBuffers(ag->al_source, 1, &buffer);
-        if (buffer) ag->twitch_free_buffers[ag->twitch_free_count++] = buffer;
+        if (buffer) {
+            twitch_audio_queue_untrack(ag, buffer);
+            ag->twitch_free_buffers[ag->twitch_free_count++] = buffer;
+        }
     }
     playback_clock_ready = !dec->live_buffer_ms || target_ms >= dec->live_buffer_ms;
     if (!ag->twitch_started && !playback_clock_ready) return;
@@ -3193,6 +3510,7 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
                                           &bytes, &samples, &sample_rate, &pts_ms)) {
         chunk_end_ms = pts_ms + ((double)samples * 1000.0) /
                        (double)(sample_rate > 0 ? sample_rate : 48000);
+        duration_ms = chunk_end_ms - pts_ms;
         if (!ag->twitch_started && chunk_end_ms + 5.0 < desired_pts_ms) {
             ag->twitch_sync_dropped_chunks++;
             continue;
@@ -3211,6 +3529,7 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
         }
         vm_alBufferData(buffer, format, ag->twitch_pcm, bytes, sample_rate);
         vm_alSourceQueueBuffers(ag->al_source, 1, &buffer);
+        twitch_audio_queue_track(ag, buffer, pts_ms, duration_ms);
         if (!ag->twitch_started && !ag->twitch_start_pts_set) {
             ag->twitch_start_pts_ms = pts_ms;
             ag->twitch_start_pts_set = 1;
@@ -3232,11 +3551,37 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
         }
         ag->twitch_started = 1;
     }
+    if (ag->twitch_started && state == AL_PLAYING_ &&
+        twitch_audio_playback_clock(ag, &playback_pts_ms)) {
+        if (!dec->live_audio_clock_valid) {
+            dec->live_audio_clock_offset_ms = desired_pts_ms - playback_pts_ms;
+            dec->live_audio_clock_valid = 1;
+            debug_line("Twitch A/V clock locked audio_pts_ms=%.1f video_pts_ms=%.1f offset_ms=%.1f",
+                       playback_pts_ms, desired_pts_ms,
+                       dec->live_audio_clock_offset_ms);
+        }
+        dec->live_audio_clock_ms = playback_pts_ms +
+                                   dec->live_audio_clock_offset_ms;
+        if (dec->live_audio_clock_ms < 0.0)
+            dec->live_audio_clock_ms = 0.0;
+    }
     if (vm_alGetError) err = vm_alGetError();
     if (err) {
         debug_line("Twitch audio OpenAL update err=0x%04x queued=%d free=%d path=\"%s\"",
                    err, queued, ag->twitch_free_count, ag->path);
     }
+}
+
+static DWORD video_decoder_twitch_synced_target_ms(video_decoder_t *dec,
+                                                     DWORD fallback_ms)
+{
+    double target_ms;
+    if (!dec || !dec->network_source || !dec->live_buffer_ms ||
+        !dec->live_audio_clock_valid) return fallback_ms;
+    target_ms = dec->live_audio_clock_ms + (double)dec->live_buffer_ms;
+    if (target_ms <= 0.0) return 0;
+    if (target_ms >= 4294967295.0) return 0xffffffffu;
+    return (DWORD)(target_ms + 0.5);
 }
 
 static audio_graph_t *audio_graph_create(const char *path, int lead_ms, int volume,
@@ -4992,19 +5337,15 @@ static FARPROC load_ffmpeg_proc(HMODULE mod, const char *name)
 
 static int ffmpeg_load_api(void)
 {
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
     char lav_dir[MAX_PATH * 2];
     if (ffmpeg_api.loaded) return 1;
     if (ffmpeg_api.failed) return 0;
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) {
+    webm_component_dir_a(lav_dir, sizeof(lav_dir),
+                         "NC-TK17-WebM-lav");
+    if (!lav_dir[0]) {
         ffmpeg_api.failed = 1;
         return 0;
     }
-    dll_path[sizeof(dll_path) - 1] = 0;
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(lav_dir, sizeof(lav_dir), bin_dir, "NC-TK17-WebM-lav");
     SetDllDirectoryA(lav_dir);
     ffmpeg_api.avutil = LoadLibraryA("avutil-lav-60.dll");
     ffmpeg_api.avcodec = LoadLibraryA("avcodec-lav-62.dll");
@@ -8153,8 +8494,6 @@ static int create_scene_video_rewrite_w(LPCWSTR original, wchar_t *redirect, siz
     char source_mb[MAX_PATH * 4];
     char sidecar[MAX_PATH * 4];
     char base[MAX_PATH];
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
     char cache_dir[MAX_PATH * 2];
     char temp_path[MAX_PATH * 4];
     HANDLE in = INVALID_HANDLE_VALUE;
@@ -8191,11 +8530,9 @@ static int create_scene_video_rewrite_w(LPCWSTR original, wchar_t *redirect, siz
 
     rewritten = rewrite_scene_for_video_a(src, base, sidecar);
     if (!rewritten) goto done;
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) goto done;
-    dll_path[sizeof(dll_path) - 1] = 0;
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(cache_dir, sizeof(cache_dir), bin_dir, "NC-TK17-WebM-Cache");
+    webm_component_dir_a(cache_dir, sizeof(cache_dir),
+                         "NC-TK17-WebM-Cache");
+    if (!cache_dir[0]) goto done;
     CreateDirectoryA(cache_dir, NULL);
     _snprintf(temp_path, sizeof(temp_path), "%s\\%s.video.bs", cache_dir, base);
     out = CreateFileA(temp_path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
@@ -8399,15 +8736,7 @@ static void ensure_dir_a(const char *path)
 
 static void cache_root_a(char *out, size_t outsz)
 {
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
-    if (!out || !outsz) return;
-    out[0] = 0;
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) return;
-    dll_path[sizeof(dll_path) - 1] = 0;
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(out, outsz, bin_dir, "NC-TK17-WebM-Cache");
+    webm_component_dir_a(out, outsz, "NC-TK17-WebM-Cache");
 }
 
 static int path_under_dir_a(const char *path, const char *dir)
@@ -9649,8 +9978,6 @@ static int create_engine_audio_script_rewrite_a(const char *original_mb, char *r
 {
     char root[MAX_PATH * 4];
     char script_path[MAX_PATH * 4];
-    char dll_path[MAX_PATH * 2];
-    char bin_dir[MAX_PATH * 2];
     char cache_dir[MAX_PATH * 2];
     char base[MAX_PATH];
     char temp_path[MAX_PATH * 4];
@@ -9708,11 +10035,9 @@ static int create_engine_audio_script_rewrite_a(const char *original_mb, char *r
         log_line("EngineAudio script rewrite failed: no ComponentArray original=\"%s\"", original_mb);
         goto done;
     }
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) goto done;
-    dll_path[sizeof(dll_path) - 1] = 0;
-    strcpy(bin_dir, dll_path);
-    dirname_inplace(bin_dir);
-    path_join(cache_dir, sizeof(cache_dir), bin_dir, "NC-TK17-WebM-Cache");
+    webm_component_dir_a(cache_dir, sizeof(cache_dir),
+                         "NC-TK17-WebM-Cache");
+    if (!cache_dir[0]) goto done;
     ensure_dir_a(cache_dir);
     basename_no_ext_a(script_path, base, sizeof(base));
     _snprintf(temp_path, sizeof(temp_path) - 1, "%s\\%s.engineaudio.%08x.bs", cache_dir, base, fnv1a_hash_a(script_path));
@@ -12226,6 +12551,9 @@ static void update_d3d8_video_textures(void)
                 elapsed = elapsed > (DWORD)vt->audio_lead_ms ? elapsed - (DWORD)vt->audio_lead_ms : 0;
             }
             if (vt->decoder) {
+                if (vt->twitch_active)
+                    elapsed = video_decoder_twitch_synced_target_ms(
+                        vt->decoder, elapsed);
                 LONGLONG decode_start = webm_perf_counter();
                 decoded = video_decoder_grab_to_time(vt->decoder, elapsed);
                 webm_perf_add(WEBM_PERF_D3D8_DECODE, decode_start);
@@ -12772,6 +13100,9 @@ static void update_video_test_texture(void)
                 elapsed = elapsed > (DWORD)vt->audio_lead_ms ? elapsed - (DWORD)vt->audio_lead_ms : 0;
             }
             if (vt->decoder) {
+                if (vt->twitch_active)
+                    elapsed = video_decoder_twitch_synced_target_ms(
+                        vt->decoder, elapsed);
                 LONGLONG decode_start = webm_perf_counter();
                 decoded = video_decoder_grab_to_time(vt->decoder, elapsed);
                 webm_perf_add(WEBM_PERF_GL_DECODE, decode_start);
@@ -14160,6 +14491,45 @@ static void path_join(char *out, size_t outsz, const char *a, const char *b)
     out[outsz - 1] = '\0';
 }
 
+static int webm_extension_root_a(char *out, size_t outsz)
+{
+    char dll_path[MAX_PATH * 2];
+    char binary_dir[MAX_PATH * 2];
+    char game_dir[MAX_PATH * 2];
+    char extensions_dir[MAX_PATH * 2];
+
+    if (!out || !outsz) return 0;
+    out[0] = 0;
+    if (!self_module ||
+        !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) {
+        return 0;
+    }
+    dll_path[sizeof(dll_path) - 1] = 0;
+    lstrcpynA(binary_dir, dll_path, sizeof(binary_dir));
+    dirname_inplace(binary_dir);
+    lstrcpynA(game_dir, binary_dir, sizeof(game_dir));
+    dirname_inplace(game_dir);
+    path_join(extensions_dir, sizeof(extensions_dir), game_dir,
+              "Extensions");
+    CreateDirectoryA(extensions_dir, NULL);
+    path_join(out, outsz, extensions_dir, "WebM");
+    CreateDirectoryA(out, NULL);
+    return out[0] != 0;
+}
+
+static void webm_component_dir_a(char *out, size_t outsz,
+                                 const char *component_name)
+{
+    char webm_dir[MAX_PATH * 2];
+    if (!out || !outsz) return;
+    out[0] = 0;
+    if (!component_name || !component_name[0] ||
+        !webm_extension_root_a(webm_dir, sizeof(webm_dir))) {
+        return;
+    }
+    path_join(out, outsz, webm_dir, component_name);
+}
+
 static int clamp_int(int value, int min_value, int max_value)
 {
     if (value < min_value) return min_value;
@@ -14169,16 +14539,11 @@ static int clamp_int(int value, int min_value, int max_value)
 
 static void config_file_path(char *out, size_t outsz)
 {
-    char dll_path[MAX_PATH * 2];
+    char webm_dir[MAX_PATH * 2];
     if (!out || !outsz) return;
     out[0] = 0;
-    if (!self_module || !GetModuleFileNameA(self_module, dll_path, sizeof(dll_path))) {
-        lstrcpynA(out, "NC-TK17-WebM.ini", (int)outsz);
-        return;
-    }
-    dll_path[sizeof(dll_path) - 1] = 0;
-    dirname_inplace(dll_path);
-    path_join(out, outsz, dll_path, "NC-TK17-WebM.ini");
+    if (!webm_extension_root_a(webm_dir, sizeof(webm_dir))) return;
+    path_join(out, outsz, webm_dir, "Config.ini");
 }
 
 static void write_default_config_if_missing(const char *path)
@@ -14344,6 +14709,11 @@ static void write_default_config_if_missing(const char *path)
         "; Global defaults for sidecars containing [NC-TK17-WebM:Twitch].\r\n"
         "; A Twitch sidecar can override any value below.\r\n"
         "; Twitch channel, random, and fallback are intentionally sidecar-only.\r\n"
+        "; OAuth tokens are encrypted for the current Windows account and stored in\r\n"
+        "; Extensions\\WebM\\NC-TK17-WebM-twitch\\auth.dat.\r\n"
+        "device_authorization=true\r\n"
+        "; Public Twitch application Client ID; this is not a secret or stream key.\r\n"
+        "client_id=3qtv6mth7so1khjgx9ecp0r3hr0s05\r\n"
         "quality=720p60\r\n"
         "; Small live-frame buffer. Higher values reduce network stutter but add latency.\r\n"
         "; Recommended: 120-250. Set 0 to disable.\r\n"
