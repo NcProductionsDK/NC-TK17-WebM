@@ -94,6 +94,12 @@ typedef struct {
     int visible_count;
     unsigned int *pixels;
     size_t pixel_count;
+    HFONT font;
+    int font_height;
+    int *row_bounds;
+    int row_bounds_height;
+    int row_bounds_valid;
+    int row_bounds_seen;
 } webm_twitch_chat_render_cache_t;
 
 struct webm_twitch_chat_session {
@@ -132,6 +138,11 @@ struct webm_twitch_chat_session {
     int resize_source_width;
     int resize_target_width;
     int resize_bytes_per_pixel;
+    int dim_table_valid;
+    float dim_table_opacity;
+    unsigned char dim_table[256];
+    unsigned char dim_table_5[32];
+    unsigned char dim_table_6[64];
 };
 
 enum {
@@ -1430,6 +1441,8 @@ void webm_twitch_chat_release(webm_twitch_chat_session_t *session)
     if (session->emote_event) CloseHandle(session->emote_event);
     for (i = 0; i < CHAT_RENDER_CACHE_COUNT; i++) {
         free(session->render_cache[i].pixels);
+        free(session->render_cache[i].row_bounds);
+        if (session->render_cache[i].font) DeleteObject(session->render_cache[i].font);
     }
     for (i = 0; i < CHAT_EMOTE_CACHE_COUNT; i++) {
         free(session->emotes[i].pixels);
@@ -1821,6 +1834,104 @@ static int layout_mixed_message(webm_twitch_chat_session_t *session,
     return (layout.y - start_y) + layout.line_height;
 }
 
+/* Called under the session lock. Keep the original float expression and
+ * RGB565 expand/truncate rules, but evaluate each input value only once.
+ * On 32-bit GCC, vectorizing the table calculation rounds intermediates to
+ * SSE float precision instead of the original scalar x87 precision. */
+#if defined(__GNUC__) && defined(__i386__)
+__attribute__((optimize("no-tree-vectorize")))
+#endif
+static void dim_chat_background(webm_twitch_chat_session_t *session,
+                                unsigned char *pixels, int height, int pitch,
+                                int x0, int chat_width,
+                                webm_twitch_chat_pixel_format_t format,
+                                int bpp, float opacity)
+{
+    int x, y;
+    if (!session->dim_table_valid || session->dim_table_opacity != opacity) {
+        for (x = 0; x < 256; x++)
+            session->dim_table[x] = (unsigned char)(int)(x * (1.0f - opacity));
+        for (x = 0; x < 32; x++)
+            session->dim_table_5[x] = session->dim_table[x * 255 / 31] >> 3;
+        for (x = 0; x < 64; x++)
+            session->dim_table_6[x] = session->dim_table[x * 255 / 63] >> 2;
+        session->dim_table_opacity = opacity;
+        session->dim_table_valid = 1;
+    }
+    for (y = 0; y < height; y++) {
+        unsigned char *dst = pixels + (size_t)y * (size_t)pitch + (size_t)x0 * (size_t)bpp;
+        if (format == WEBM_TWITCH_CHAT_RGB565) {
+            for (x = 0; x < chat_width; x++, dst += bpp) {
+                unsigned int value = dst[0] | ((unsigned int)dst[1] << 8);
+                unsigned int result = ((unsigned int)session->dim_table_5[value >> 11] << 11) |
+                    ((unsigned int)session->dim_table_6[(value >> 5) & 63] << 5) |
+                    session->dim_table_5[value & 31];
+                dst[0] = (unsigned char)result;
+                dst[1] = (unsigned char)(result >> 8);
+            }
+        } else if (bpp == 4) {
+            for (x = 0; x < chat_width; x++, dst += 4) {
+                dst[0] = session->dim_table[dst[0]];
+                dst[1] = session->dim_table[dst[1]];
+                dst[2] = session->dim_table[dst[2]];
+                dst[3] = 255;
+            }
+        } else {
+            for (x = 0; x < chat_width; x++, dst += bpp) {
+                dst[0] = session->dim_table[dst[0]];
+                dst[1] = session->dim_table[dst[1]];
+                dst[2] = session->dim_table[dst[2]];
+            }
+        }
+    }
+}
+
+/* Bounds describe only pixels the original compositor would write. Cache
+ * them alongside the rendered overlay; video pixels still blend every frame. */
+static const int *chat_overlay_row_bounds(webm_twitch_chat_session_t *session,
+                                          const unsigned int *overlay)
+{
+    int i, x, y;
+    for (i = 0; i < CHAT_RENDER_CACHE_COUNT; i++) {
+        webm_twitch_chat_render_cache_t *cache = &session->render_cache[i];
+        if (cache->pixels != overlay) continue;
+        if (cache->row_bounds_valid) return cache->row_bounds;
+        /* A rapidly changing chat may redraw on every video frame. Only
+         * build bounds once the overlay is actually reused, so those frames
+         * pay just the original compositor scan, not a second full scan. */
+        if (!cache->row_bounds_seen) {
+            cache->row_bounds_seen = 1;
+            return NULL;
+        }
+        if (cache->row_bounds_height < cache->height) {
+            int *grown = (int*)realloc(cache->row_bounds, (size_t)cache->height * 2u * sizeof(int));
+            if (!grown) return NULL; /* Retain the rectangular scan on failure. */
+            cache->row_bounds = grown;
+            cache->row_bounds_height = cache->height;
+        }
+        memset(cache->row_bounds, 0, (size_t)cache->height * 2u * sizeof(int));
+        for (y = cache->content_top; y < cache->content_bottom; y++) {
+            const unsigned int *row = overlay + (size_t)y * (size_t)cache->width;
+            int left = cache->content_right, right = cache->content_left;
+            for (x = cache->content_left; x < cache->content_right; x++) {
+                unsigned int value = row[x];
+                if ((value >> 24) || (value & 255) > 4 ||
+                    ((value >> 8) & 255) > 4 || ((value >> 16) & 255) > 4) {
+                    if (left > x) left = x;
+                    right = x + 1;
+                }
+            }
+            if (left < right) {
+                cache->row_bounds[y * 2] = left;
+                cache->row_bounds[y * 2 + 1] = right;
+            }
+        }
+        cache->row_bounds_valid = 1;
+        return cache->row_bounds;
+    }
+    return NULL;
+}
+
 static unsigned int *render_chat_overlay(webm_twitch_chat_session_t *session,
                                          const webm_twitch_chat_message_t *messages,
                                          int message_start, int message_count,
@@ -1918,9 +2029,14 @@ static unsigned int *render_chat_overlay(webm_twitch_chat_session_t *session,
         if (font_height < 10) font_height = 10;
         if (font_height > 28) font_height = 28;
     }
-    font = CreateFontW(-font_height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    if (!cache->font || cache->font_height != font_height) {
+        if (cache->font) DeleteObject(cache->font);
+        cache->font = CreateFontW(-font_height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+        cache->font_height = font_height;
+    }
+    font = cache->font;
     old_font = SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
     bounds.left = padding_x;
@@ -1996,6 +2112,8 @@ static unsigned int *render_chat_overlay(webm_twitch_chat_session_t *session,
        Flush GDI before caching those bits so mixed messages contain both. */
     GdiFlush();
     memcpy(cache->pixels, overlay, pixel_count * sizeof(unsigned int));
+    cache->row_bounds_valid = 0;
+    cache->row_bounds_seen = 0;
     cache->content_left = padding_x;
     cache->content_right = chat_width - padding_x;
     cache->content_top = message_count > 0 ? cursor_y : CHAT_PADDING_Y;
@@ -2021,10 +2139,45 @@ static unsigned int *render_chat_overlay(webm_twitch_chat_session_t *session,
     *content_bottom = cache->content_bottom;
     SelectObject(dc, old_font);
     SelectObject(dc, old_bitmap);
-    DeleteObject(font);
     DeleteObject(bitmap);
     DeleteDC(dc);
     return cache->pixels;
+}
+
+/* GDI text and decoded emotes are already BGRA. Opaque pixels can be copied
+ * directly into a 32-bit DirectX texture; only translucent emotes need a
+ * destination read and channel blending. Keep the generic compositor below
+ * for RGB/OpenGL and packed/24-bit destinations. */
+static void compose_bgra_chat_overlay(unsigned char *pixels, int height, int pitch,
+                                      const unsigned int *overlay, int chat_width, int x0,
+                                      int flip, int top, int bottom, int left, int right,
+                                      const int *row_bounds)
+{
+    int x, y;
+    for (y = top; y < bottom; y++) {
+        int first = row_bounds ? row_bounds[y * 2] : left;
+        int last = row_bounds ? row_bounds[y * 2 + 1] : right;
+        int target_y = flip ? height - 1 - y : y;
+        unsigned char *row = pixels + (size_t)target_y * (size_t)pitch;
+        const unsigned int *src = overlay + (size_t)y * (size_t)chat_width;
+        for (x = first; x < last; x++) {
+            unsigned int value = src[x];
+            unsigned int a = value >> 24;
+            unsigned char *dst;
+            if (!a && (value & 255) <= 4 && ((value >> 8) & 255) <= 4 &&
+                ((value >> 16) & 255) <= 4) continue;
+            dst = row + (size_t)(x0 + x) * 4u;
+            if (a && a < 255) {
+                unsigned int inverse = 255 - a;
+                unsigned int b = ((value & 255) * a + dst[0] * inverse + 127) / 255;
+                unsigned int g = (((value >> 8) & 255) * a + dst[1] * inverse + 127) / 255;
+                unsigned int r = (((value >> 16) & 255) * a + dst[2] * inverse + 127) / 255;
+                value = b | (g << 8) | (r << 16);
+            }
+            value |= 0xFF000000u;
+            memcpy(dst, &value, sizeof(value));
+        }
+    }
 }
 
 void webm_twitch_chat_compose(webm_twitch_chat_session_t *session,
@@ -2066,18 +2219,8 @@ void webm_twitch_chat_compose(webm_twitch_chat_session_t *session,
         resize_video_for_chat(session, pixels, width, height, pitch, chat_width,
                               chat_left, bytes_per_pixel);
     } else {
-        for (y = 0; y < height; y++) {
-            unsigned char *row = pixels + (size_t)y * (size_t)pitch;
-            for (x = x0; x < x0 + chat_width; x++) {
-                unsigned char *pixel = row + (size_t)x * (size_t)bytes_per_pixel;
-                int r, g, b;
-                pixel_read(pixel, format, bytes_per_pixel, &r, &g, &b);
-                pixel_write(pixel, format, bytes_per_pixel,
-                            (int)(r * (1.0f - opacity)),
-                            (int)(g * (1.0f - opacity)),
-                            (int)(b * (1.0f - opacity)));
-            }
-        }
+        dim_chat_background(session, pixels, height, pitch, x0, chat_width,
+                            format, bytes_per_pixel, opacity);
     }
 
     message_count = session->message_count;
@@ -2100,28 +2243,37 @@ void webm_twitch_chat_compose(webm_twitch_chat_session_t *session,
                                   &content_left, &content_top,
                                   &content_right, &content_bottom);
     if (overlay) {
-        for (y = content_top; y < content_bottom; y++) {
-            int target_y = flip_text_vertical ? height - 1 - y : y;
-            unsigned char *row = pixels + (size_t)target_y * (size_t)pitch;
-            unsigned int *source = overlay + (size_t)y * (size_t)chat_width;
-            for (x = content_left; x < content_right; x++) {
-                unsigned int value = source[x];
-                int b = value & 255;
-                int g = (value >> 8) & 255;
-                int r = (value >> 16) & 255;
-                int a = (value >> 24) & 255;
-                if (a || r > 4 || g > 4 || b > 4) {
-                    unsigned char *target = row +
-                                            (size_t)(x0 + x) * (size_t)bytes_per_pixel;
-                    if (!a) a = 255;
-                    if (a < 255) {
-                        int dr, dg, db;
-                        pixel_read(target, format, bytes_per_pixel, &dr, &dg, &db);
-                        r = (r * a + dr * (255 - a) + 127) / 255;
-                        g = (g * a + dg * (255 - a) + 127) / 255;
-                        b = (b * a + db * (255 - a) + 127) / 255;
+        const int *row_bounds = chat_overlay_row_bounds(session, overlay);
+        if (format == WEBM_TWITCH_CHAT_BGR && bytes_per_pixel == 4) {
+            compose_bgra_chat_overlay(pixels, height, pitch, overlay, chat_width, x0,
+                                      flip_text_vertical, content_top, content_bottom,
+                                      content_left, content_right, row_bounds);
+        } else {
+            for (y = content_top; y < content_bottom; y++) {
+                int left = row_bounds ? row_bounds[y * 2] : content_left;
+                int right = row_bounds ? row_bounds[y * 2 + 1] : content_right;
+                int target_y = flip_text_vertical ? height - 1 - y : y;
+                unsigned char *row = pixels + (size_t)target_y * (size_t)pitch;
+                unsigned int *source = overlay + (size_t)y * (size_t)chat_width;
+                for (x = left; x < right; x++) {
+                    unsigned int value = source[x];
+                    int b = value & 255;
+                    int g = (value >> 8) & 255;
+                    int r = (value >> 16) & 255;
+                    int a = (value >> 24) & 255;
+                    if (a || r > 4 || g > 4 || b > 4) {
+                        unsigned char *target = row +
+                                                (size_t)(x0 + x) * (size_t)bytes_per_pixel;
+                        if (!a) a = 255;
+                        if (a < 255) {
+                            int dr, dg, db;
+                            pixel_read(target, format, bytes_per_pixel, &dr, &dg, &db);
+                            r = (r * a + dr * (255 - a) + 127) / 255;
+                            g = (g * a + dg * (255 - a) + 127) / 255;
+                            b = (b * a + db * (255 - a) + 127) / 255;
+                        }
+                        pixel_write(target, format, bytes_per_pixel, r, g, b);
                     }
-                    pixel_write(target, format, bytes_per_pixel, r, g, b);
                 }
             }
         }
@@ -2224,6 +2376,31 @@ void webm_twitch_chat_downsample_half(const unsigned char *source,
         target_width < 1 || target_height < 1 || bytes_per_pixel < 2 ||
         source_pitch < source_width * bytes_per_pixel ||
         target_pitch < target_width * bytes_per_pixel) return;
+    /* Ordinary 32-bit mip levels need no per-pixel format dispatch or edge
+     * clamping. Keep the identical four-sample sum and +2 rounding, including
+     * alpha; edge-clamped sizes and other formats retain the generic path. */
+    if (bytes_per_pixel == 4 && target_width <= source_width / 2 &&
+        target_height <= source_height / 2) {
+        for (y = 0; y < target_height; y++) {
+            const unsigned char *row0 = source + (size_t)(y * 2) * (size_t)source_pitch;
+            const unsigned char *row1 = row0 + source_pitch;
+            unsigned char *dst = target + (size_t)y * (size_t)target_pitch;
+            for (x = 0; x < target_width; x++) {
+                unsigned int a, b, c, d, rb, ga, result;
+                memcpy(&a, row0 + (size_t)x * 8u, 4);
+                memcpy(&b, row0 + (size_t)x * 8u + 4u, 4);
+                memcpy(&c, row1 + (size_t)x * 8u, 4);
+                memcpy(&d, row1 + (size_t)x * 8u + 4u, 4);
+                rb = (a & 0x00FF00FFu) + (b & 0x00FF00FFu) +
+                     (c & 0x00FF00FFu) + (d & 0x00FF00FFu) + 0x00020002u;
+                ga = ((a >> 8) & 0x00FF00FFu) + ((b >> 8) & 0x00FF00FFu) +
+                     ((c >> 8) & 0x00FF00FFu) + ((d >> 8) & 0x00FF00FFu) + 0x00020002u;
+                result = ((rb >> 2) & 0x00FF00FFu) | (((ga >> 2) & 0x00FF00FFu) << 8);
+                memcpy(dst + (size_t)x * 4u, &result, 4);
+            }
+        }
+        return;
+    }
     for (y = 0; y < target_height; y++) {
         int source_y0 = y * 2;
         int source_y1;

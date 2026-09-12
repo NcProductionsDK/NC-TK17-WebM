@@ -4175,24 +4175,21 @@ static int video_decoder_live_prepare_frame(video_decoder_t *dec, DWORD target_m
     }
     queued = &dec->live_queue[selected];
     if (queued->data && queued->size > 0) {
-        if (dec->live_present_frame_size < queued->size) {
-            BYTE *frame = (BYTE*)realloc(dec->live_present_frame,
-                                         (size_t)queued->size);
-            if (frame) {
-                dec->live_present_frame = frame;
-                dec->live_present_frame_size = queued->size;
-            }
-        }
-        if (dec->live_present_frame &&
-            dec->live_present_frame_size >= queued->size) {
-            memcpy(dec->live_present_frame, queued->data, (size_t)queued->size);
-            present_size = queued->size;
-            present_width = queued->width;
-            present_height = queued->height;
-            present_stride = queued->stride;
-            present_frame_index = queued->frame_index;
-            prepared = 1;
-        }
+        /* This slot has been consumed. Recycle the presentation buffer into
+         * it while the producer is excluded, instead of copying its pixels.
+         * Both buffers use malloc/free (the FFmpeg frame does not). */
+        BYTE *spare = dec->live_present_frame;
+        size_t spare_capacity = (size_t)dec->live_present_frame_size;
+        dec->live_present_frame = queued->data;
+        dec->live_present_frame_size = (long)queued->capacity;
+        queued->data = spare;
+        queued->capacity = spare_capacity;
+        present_size = queued->size;
+        present_width = queued->width;
+        present_height = queued->height;
+        present_stride = queued->stride;
+        present_frame_index = queued->frame_index;
+        prepared = 1;
     }
     LeaveCriticalSection(&dec->live_queue_lock);
 
@@ -4564,7 +4561,7 @@ static int d3d8_native_format_bpp(int format)
     return 0;
 }
 
-static int convert_rgb24_to_d3d8(BYTE *dst_base, int dst_pitch, int format,
+static int convert_rgb24_to_d3d8_scalar(BYTE *dst_base, int dst_pitch, int format,
                                   int width, int height, const BYTE *source_frame,
                                   int source_width, int source_height, int source_stride)
 {
@@ -4620,6 +4617,96 @@ static int convert_rgb24_to_d3d8(BYTE *dst_base, int dst_pitch, int format,
                 sx++;
                 sx_error -= width;
             }
+        }
+    }
+    return 1;
+}
+
+/* Preserve the scalar converter's exact nearest-neighbour coordinates,
+ * vertical flip, channel order and opaque alpha. The supported texture width
+ * is at most 4096; retain the original routine for larger callers. */
+static int convert_rgb24_to_d3d8(BYTE *dst_base, int dst_pitch, int format,
+                                  int width, int height, const BYTE *source_frame,
+                                  int source_width, int source_height, int source_stride)
+{
+    int offsets[4096];
+    int x, y, sx = 0, error = 0, previous_sy = -1;
+    int step, remainder;
+    int bpp = d3d8_native_format_bpp(format);
+    if (!dst_base || !source_frame || bpp <= 0 || width <= 0 || height <= 0 ||
+        source_width <= 0 || source_height <= 0 || source_stride <= 0 ||
+        dst_pitch < width * bpp) return 0;
+    if (width > (int)(sizeof(offsets) / sizeof(offsets[0]))) {
+        return convert_rgb24_to_d3d8_scalar(dst_base, dst_pitch, format, width, height,
+                                            source_frame, source_width, source_height,
+                                            source_stride);
+    }
+    /* Calculate horizontal sampling once, instead of once for every row. */
+    step = source_width / width;
+    remainder = source_width % width;
+    for (x = 0; x < width; x++) {
+        offsets[x] = sx * 3;
+        sx += step;
+        error += remainder;
+        if (error >= width) {
+            sx++;
+            error -= width;
+        }
+    }
+    for (y = 0; y < height; y++) {
+        BYTE *dst = dst_base + (size_t)y * (size_t)dst_pitch;
+        int sy = ((height - 1 - y) * source_height) / height;
+        const BYTE *row = source_frame + (size_t)sy * (size_t)source_stride;
+        if (sy == previous_sy) {
+            memcpy(dst, dst - dst_pitch, (size_t)width * (size_t)bpp);
+            continue;
+        }
+        previous_sy = sy;
+        /* Keep format decisions out of the pixel loop. memcpy stores permit
+         * unaligned pitches without type-punning or alignment assumptions. */
+        switch (format) {
+        case D3DFMT_A8R8G8B8:
+        case D3DFMT_X8R8G8B8:
+            for (x = 0; x < width; x++) {
+                const BYTE *src = row + offsets[x];
+                DWORD pixel = 0xff000000u | ((DWORD)src[0] << 16) |
+                              ((DWORD)src[1] << 8) | (DWORD)src[2];
+                memcpy(dst + x * 4, &pixel, sizeof(pixel));
+            }
+            break;
+        case WEBM_CACHE_FORMAT_GL_RGBA:
+            for (x = 0; x < width; x++) {
+                const BYTE *src = row + offsets[x];
+                DWORD pixel = 0xff000000u | ((DWORD)src[2] << 16) |
+                              ((DWORD)src[1] << 8) | (DWORD)src[0];
+                memcpy(dst + x * 4, &pixel, sizeof(pixel));
+            }
+            break;
+        case D3DFMT_R5G6B5:
+            for (x = 0; x < width; x++) {
+                const BYTE *src = row + offsets[x];
+                WORD pixel = (WORD)(((src[0] >> 3) << 11) |
+                                    ((src[1] >> 2) << 5) | (src[2] >> 3));
+                memcpy(dst + x * 2, &pixel, sizeof(pixel));
+            }
+            break;
+        case WEBM_CACHE_FORMAT_GL_RGB:
+            if (width == source_width) {
+                memcpy(dst, row, (size_t)width * 3u);
+            } else {
+                for (x = 0; x < width; x++) {
+                    memcpy(dst + x * 3, row + offsets[x], 3);
+                }
+            }
+            break;
+        default: /* D3DFMT_R8G8B8 */
+            for (x = 0; x < width; x++) {
+                const BYTE *src = row + offsets[x];
+                dst[x * 3] = src[2];
+                dst[x * 3 + 1] = src[1];
+                dst[x * 3 + 2] = src[0];
+            }
+            break;
         }
     }
     return 1;
@@ -5020,6 +5107,9 @@ static void video_decoder_unpin_d3d8_cached_mip(video_decoder_t *dec,
 static void video_decoder_async_publish_frame(video_decoder_t *dec, long frame_index)
 {
     int cache_built = 0;
+    int frame_changed;
+    int index_changed;
+    int frame_prepared = 0;
     d3d8_cache_build_t cache_build;
     if (!dec || !dec->frame || dec->frame_size <= 0 || frame_index < 0) return;
     cache_built = video_decoder_build_d3d8_cache(dec, &cache_build,
@@ -5027,16 +5117,54 @@ static void video_decoder_async_publish_frame(video_decoder_t *dec, long frame_i
                                                   dec->width, dec->height,
                                                   dec->stride, frame_index);
     EnterCriticalSection(&dec->async_frame_lock);
-    if (dec->frame_size > dec->async_frame_size) {
-        BYTE *new_frame = (BYTE*)realloc(dec->async_frame, (size_t)dec->frame_size);
-        if (new_frame) {
-            dec->async_frame = new_frame;
-            dec->async_frame_size = dec->frame_size;
+    index_changed = dec->async_decoded_frame_index != frame_index;
+    frame_changed = !dec->async_frame || dec->looped ||
+                    index_changed ||
+                    dec->async_width != dec->width ||
+                    dec->async_height != dec->height ||
+                    dec->async_stride != dec->stride;
+    LeaveCriticalSection(&dec->async_frame_lock);
+    /* Only this presentation worker owns the spare buffer. Keep allocations
+     * and full-frame copies outside the lock used by the render thread.
+     * Still build/commit a changed cache when the video frame is unchanged. */
+    if (frame_changed) {
+        if (dec->frame_size > dec->live_present_frame_size) {
+            BYTE *new_frame = (BYTE*)realloc(dec->live_present_frame, (size_t)dec->frame_size);
+            if (new_frame) {
+                dec->live_present_frame = new_frame;
+                dec->live_present_frame_size = dec->frame_size;
+            }
+        }
+        if (dec->live_present_frame && dec->live_present_frame_size >= dec->frame_size) {
+            memcpy(dec->live_present_frame, dec->frame, (size_t)dec->frame_size);
+            frame_prepared = 1;
         }
     }
-    if (dec->async_frame && dec->async_frame_size >= dec->frame_size) {
-        int frame_changed = dec->async_decoded_frame_index != frame_index;
-        memcpy(dec->async_frame, dec->frame, (size_t)dec->frame_size);
+    EnterCriticalSection(&dec->async_frame_lock);
+    if (frame_prepared) {
+        BYTE *old_frame = dec->async_frame;
+        long old_capacity = dec->async_frame_size;
+        dec->async_frame = dec->live_present_frame;
+        dec->async_frame_size = dec->live_present_frame_size;
+        dec->live_present_frame = old_frame;
+        dec->live_present_frame_size = old_capacity;
+    }
+    if (frame_changed && !frame_prepared) {
+        /* The spare is an optimization, not a playback requirement. Under
+         * memory pressure retain the original locked-copy fallback. */
+        if (dec->frame_size > dec->async_frame_size) {
+            BYTE *new_frame = (BYTE*)realloc(dec->async_frame, (size_t)dec->frame_size);
+            if (new_frame) {
+                dec->async_frame = new_frame;
+                dec->async_frame_size = dec->frame_size;
+            }
+        }
+        if (dec->async_frame && dec->async_frame_size >= dec->frame_size) {
+            memcpy(dec->async_frame, dec->frame, (size_t)dec->frame_size);
+            frame_prepared = 1;
+        }
+    }
+    if (frame_prepared || !frame_changed) {
         dec->async_width = dec->width;
         dec->async_height = dec->height;
         dec->async_stride = dec->stride;
@@ -5056,7 +5184,7 @@ static void video_decoder_async_publish_frame(video_decoder_t *dec, long frame_i
                 dec->async_d3d8_cache_level_width[level] = cache_build.level_width[level];
                 dec->async_d3d8_cache_level_height[level] = cache_build.level_height[level];
             }
-        } else if (frame_changed) {
+        } else if (index_changed) {
             dec->async_d3d8_cache_ready = 0;
             dec->async_d3d8_cache_ready_levels = 0;
         }
@@ -10973,27 +11101,18 @@ static int video_decoder_copy_gl_cached_frame(video_decoder_t *dec, BYTE *pixels
     int bpp = gl_bytes_per_pixel(format, type);
     size_t bytes;
     int copied = 0;
+    d3d8_cached_mip_view_t view;
     if (!dec || !dec->async_enabled || !dec->async_lock_initialized || !pixels ||
         cache_format == 0 || bpp <= 0 || width <= 0 || height <= 0) return 0;
     bytes = (size_t)width * (size_t)height * (size_t)bpp;
     if (!bytes || bytes > pixels_size) return 0;
-    EnterCriticalSection(&dec->async_frame_lock);
-    if (dec->async_d3d8_cache_ready &&
-        dec->async_d3d8_cache_ready_generation == dec->async_d3d8_cache_generation &&
-        dec->async_d3d8_cache_frame_index == dec->async_decoded_frame_index &&
-        dec->async_d3d8_cache_format == cache_format &&
-        dec->async_d3d8_cache_ready_levels >= 1 &&
-        dec->async_d3d8_cache_level_width[0] == width &&
-        dec->async_d3d8_cache_level_height[0] == height &&
-        dec->async_d3d8_cache_level_pitch[0] == width * bpp &&
-        dec->async_d3d8_cache[dec->async_d3d8_cache_front]) {
-        memcpy(pixels,
-               dec->async_d3d8_cache[dec->async_d3d8_cache_front] +
-                   dec->async_d3d8_cache_level_offset[0],
-               bytes);
-        copied = 1;
+    if (video_decoder_pin_d3d8_cached_mip(dec, 0, width, height, cache_format, &view)) {
+        if (view.pitch == width * bpp) {
+            memcpy(pixels, view.pixels, bytes);
+            copied = 1;
+        }
+        video_decoder_unpin_d3d8_cached_mip(dec, &view);
     }
-    LeaveCriticalSection(&dec->async_frame_lock);
     return copied;
 }
 
