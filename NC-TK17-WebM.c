@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <dshow.h>
@@ -1604,10 +1605,30 @@ static int copy_engine_string_a(const char *value, char *out, size_t outsz)
             return 1;
         }
     }
-    for (i = 0; i + 1 < outsz; i++) {
-        if (!ptr_readable(value + i, 1)) return 0;
-        out[i] = value[i];
-        if (!out[i]) return 1;
+    /* Plain C-string fallback: validate each region once, rather than
+       querying Windows for every character. Keep permissions local to this
+       copy and recheck before crossing a region boundary. */
+    i = 0;
+    while (i + 1 < outsz) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t address = (uintptr_t)value + i;
+        uintptr_t region_end;
+        size_t count;
+        DWORD protect;
+        if (address < (uintptr_t)value ||
+            !VirtualQuery((const void*)address, &mbi, sizeof(mbi))) return 0;
+        protect = mbi.Protect & 0xff;
+        if (mbi.State != MEM_COMMIT || protect == PAGE_NOACCESS ||
+            protect == PAGE_EXECUTE || (mbi.Protect & PAGE_GUARD)) return 0;
+        region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (region_end <= address) return 0;
+        count = region_end - address;
+        if (count > outsz - 1 - i) count = outsz - 1 - i;
+        while (count--) {
+            out[i] = value[i];
+            if (!out[i]) return 1;
+            i++;
+        }
     }
     out[outsz - 1] = 0;
     return 1;
