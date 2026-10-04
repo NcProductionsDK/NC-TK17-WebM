@@ -2,4 +2,5 @@ git-push.bat
 /build/webm-performance-tests.exe
 /build/webm-chat-performance-tests.exe
 /build/webm-twitch-volume-tests.exe
+/build/webm-h5m-tests.exe
 /build/backups/

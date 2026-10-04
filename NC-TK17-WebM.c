@@ -1069,6 +1069,10 @@ typedef struct {
     int active;
     IDirect3DTexture8 *texture;
     IDirect3DTexture8 *video_texture;
+    ID3D11ShaderResourceView *h5m_original_view;
+    ID3D11ShaderResourceView *h5m_video_view;
+    BYTE *h5m_pixels;
+    size_t h5m_pixels_size;
     int width;
     int height;
     UINT levels;
@@ -1307,6 +1311,14 @@ static const char *find_scene_decl_i(const char *src, const char *needle);
 static int contains_i(const char *s, const char *needle);
 static int ptr_readable(const void *p, size_t bytes);
 static void patch_all_modules(void);
+static void h5m_process_views(void);
+static void h5m_clear_views(void);
+static void h5m_write_target_catalog(void);
+static void h5m_patch_context(ID3D11DeviceContext *context);
+static int h5m_upload_frame(video_d3d8_texture_t *vt);
+static void h5m_configure_audio(video_d3d8_texture_t *vt);
+static int h5m_audio_position(const char *name, float source[3]);
+static void STDMETHODCALLTYPE hook_h5m_PSSetShaderResources(ID3D11DeviceContext *self, UINT start, UINT count, ID3D11ShaderResourceView *const *views);
 static void resolve_gl_runtime_functions(void);
 static void patch_iat(HMODULE mod, const char *dll, const char *name, void *hook, void **real);
 static int patch_iat_pointer(HMODULE mod, void *target, void *hook);
@@ -3074,6 +3086,22 @@ static void audio_graph_update_3d(audio_graph_t *ag, DWORD now)
     if (!ag->openal && !ag->basic_audio) return;
     if (ag->last_3d_tick && (now - ag->last_3d_tick) < 100) return;
     ag->last_3d_tick = now;
+
+    /* Native Hook5 emitters already have camera-relative coordinates. Keep
+       this source relative; never alter the game's shared OpenAL listener. */
+    if (!_strnicmp(ag->source_name, "h5m:", 4)) {
+        int positioned = h5m_audio_position(ag->source_name, source);
+        if (ag->openal) {
+            if (vm_alSourcei) vm_alSourcei(ag->al_source, 0x202, 1); /* AL_SOURCE_RELATIVE */
+            if (vm_alSourcefv) vm_alSourcefv(ag->al_source, 0x1004, source);
+        }
+        if (!ag->logged_source_found && positioned) {
+            ag->logged_source_found = 1;
+            log_line("H5M spatial audio active node=\"%s\" position=(%.3f %.3f %.3f)",
+                     ag->source_name, source[0], source[1], source[2]);
+        }
+        return;
+    }
 
     resolve_engine_audio_symbols();
 
@@ -11471,6 +11499,9 @@ static void clear_d3d8_texture_slot(video_d3d8_texture_t *slot)
     }
     texture = slot->texture;
     video_texture = slot->video_texture;
+    if (slot->h5m_original_view) ID3D11ShaderResourceView_Release(slot->h5m_original_view);
+    if (slot->h5m_video_view) ID3D11ShaderResourceView_Release(slot->h5m_video_view);
+    free(slot->h5m_pixels);
     if (slot->active) unregister_active_d3d8_slot(slot);
     if (slot->audio_graph) {
         audio_graph_release(slot->audio_graph);
@@ -12289,6 +12320,8 @@ static void refresh_d3d8_texture_settings(video_d3d8_texture_t *vt, DWORD now)
     vt->playback_start_tick = 0;
     vt->twitch_active = 0;
     vt->twitch_fallback_active = 0;
+    vt->uploaded_frame_index = -1;
+    vt->uploaded_frame_serial = 0;
     vt->twitch_session = create_twitch_session_a(vt->sidecar_ini_path,
                                                   &vt->twitch_settings,
                                                   &vt->twitch_logged_state);
@@ -12585,7 +12618,7 @@ static void update_d3d8_video_textures(void)
         int allow_local_webm = 1;
         long decoded_frame_index;
         IDirect3DTexture8 *upload_texture;
-        if (!vt->active || !vt->texture) continue;
+        if (!vt->active || (!vt->texture && !vt->h5m_original_view)) continue;
         upload_texture = vt->video_texture ? vt->video_texture : vt->texture;
         if (!vt->last_bound_tick || (now - vt->last_bound_tick) > 1000) {
             if (vt->audio_graph) {
@@ -12603,6 +12636,7 @@ static void update_d3d8_video_textures(void)
             continue;
         }
         refresh_d3d8_texture_settings(vt, now);
+        if (vt->h5m_original_view) h5m_configure_audio(vt);
         if (vt->last_update_tick && (now - vt->last_update_tick) < (vt->update_interval_ms ? vt->update_interval_ms : texture_video_interval_ms)) continue;
         vt->last_update_tick = now;
         vt->frame++;
@@ -12806,6 +12840,13 @@ static void update_d3d8_video_textures(void)
         if (!vt->twitch_active && vt->audio_enabled && !vt->audio_graph && !vt->engine_audio) continue;
         decoded_frame_index = video_decoder_frame_index(vt->decoder);
         if (!decoded && vt->uploaded_frame_index == decoded_frame_index) continue;
+        if (vt->h5m_original_view) {
+            if (h5m_upload_frame(vt)) {
+                vt->uploaded_frame_index = decoded_frame_index;
+                vt->uploaded_frame_serial++;
+            }
+            continue;
+        }
         max_levels = vt->level_count ? vt->level_count : 1;
         if (max_levels > 8) max_levels = 8;
         if (vt->d3d8_mip_levels > 0 &&
@@ -13663,6 +13704,7 @@ static void capture_d3d11_runtime(ID3D11Device *device, ID3D11DeviceContext *con
     patch_vtable_slot(device, 5, (void*)hook_d3d11_CreateTexture2D,
                       (void**)&real_d3d11_CreateTexture2D);
     if (captured_d3d11_device == device && captured_d3d11_context == context) return;
+    h5m_clear_views();
     clear_d3d11_filter_overrides(1);
     if (captured_d3d11_context) ID3D11DeviceContext_Release(captured_d3d11_context);
     if (captured_d3d11_device) ID3D11Device_Release(captured_d3d11_device);
@@ -13670,10 +13712,13 @@ static void capture_d3d11_runtime(ID3D11Device *device, ID3D11DeviceContext *con
     ID3D11DeviceContext_AddRef(context);
     captured_d3d11_device = device;
     captured_d3d11_context = context;
+    h5m_patch_context(context);
     captured_d3d11_generation++;
     if (!captured_d3d11_generation) captured_d3d11_generation = 1;
     debug_line("D3D11 runtime captured device=%p context=%p", device, context);
 }
+
+#include "webm_h5m.h"
 
 static HRESULT WINAPI hook_D3D11CreateDeviceAndSwapChain(
     IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type, HMODULE software, UINT flags,
@@ -13984,6 +14029,7 @@ static HRESULT WINAPI hook_d3d8_Present(IDirect3DDevice8 *self, const RECT *src_
         webm_perf_prepare(now);
         perf_start = webm_perf_counter();
     }
+    h5m_process_views();
     update_d3d8_video_textures();
     game_audio_refresh_mutes();
     webm_perf_add(WEBM_PERF_D3D8_TOTAL, perf_start);
@@ -14017,6 +14063,7 @@ static HRESULT WINAPI hook_d3d8_CreateDevice(IDirect3D8 *self, UINT adapter, D3D
     if (SUCCEEDED(hr) && returned_device && *returned_device) {
         restore_hook5_proxy_resource_aliases();
         clear_d3d11_filter_overrides(1);
+        h5m_clear_views();
         clear_all_d3d8_texture_slots();
         memset(d3d8_bound_textures, 0, sizeof(d3d8_bound_textures));
         memset(d3d8_bound_video_slots, 0, sizeof(d3d8_bound_video_slots));
@@ -14033,6 +14080,17 @@ static IDirect3D8 *WINAPI hook_Direct3DCreate8(UINT sdk_version)
     int patched_swap = 0;
     int patched_device = 0;
     if (wrapper) {
+        HMODULE d3dx = GetModuleHandleA("d3dx11_43.dll");
+        if (d3dx && !h5m_real_LoadView) {
+            h5m_real_LoadView = (h5m_load_view_t)(real_GetProcAddress ?
+                real_GetProcAddress(d3dx, "D3DX11CreateShaderResourceViewFromFileW") :
+                GetProcAddress(d3dx, "D3DX11CreateShaderResourceViewFromFileW"));
+        }
+        if (h5m_real_LoadView) {
+            int patched_h5m = patch_iat_pointer(wrapper, (void*)h5m_real_LoadView,
+                                                (void*)hook_h5m_LoadView);
+            debug_line("H5M native texture loader hook imports=%d", patched_h5m);
+        }
         if (d3d11 && !real_D3D11CreateDeviceAndSwapChain) {
             real_D3D11CreateDeviceAndSwapChain = (d3d11_CreateDeviceAndSwapChain_t)
                 (real_GetProcAddress ? real_GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain") :
@@ -14146,6 +14204,13 @@ static FARPROC WINAPI hook_GetProcAddress(HMODULE mod, LPCSTR name)
     if (!name || !mod) return ret;
     modname[0] = 0;
     GetModuleFileNameA(mod, modname, sizeof(modname));
+    if ((ULONG_PTR)name < 0x10000u) return ret;
+    if (contains_i(modname, "d3dx11_43.dll") &&
+        strcmp(name, "D3DX11CreateShaderResourceViewFromFileW") == 0 && ret) {
+        if (!h5m_real_LoadView && ret != (FARPROC)hook_h5m_LoadView)
+            h5m_real_LoadView = (h5m_load_view_t)ret;
+        return (FARPROC)hook_h5m_LoadView;
+    }
     if (contains_i(modname, "opengl32.dll")) {
         return hook_gl_proc_by_name(name, ret);
     }
@@ -14471,6 +14536,8 @@ static void patch_module(HMODULE mod)
     patch_iat(mod, "D3D8.dll", "Direct3DCreate8", hook_Direct3DCreate8, (void**)&real_Direct3DCreate8);
     patch_iat(mod, "D3D11.dll", "D3D11CreateDeviceAndSwapChain", hook_D3D11CreateDeviceAndSwapChain,
               (void**)&real_D3D11CreateDeviceAndSwapChain);
+    patch_iat(mod, "d3dx11_43.dll", "D3DX11CreateShaderResourceViewFromFileW",
+              hook_h5m_LoadView, (void**)&h5m_real_LoadView);
     patch_iat(mod, "D3D11.dll", "D3D11CreateDevice", hook_D3D11CreateDevice,
               (void**)&real_D3D11CreateDevice);
 
@@ -15217,6 +15284,7 @@ __declspec(dllexport) int loadextension(void)
     audio_cache_manifest_cleanup_a();
     debug_line("loadextension");
     patch_all_modules();
+    h5m_write_target_catalog();
     return 1;
 }
 
@@ -15226,6 +15294,7 @@ __declspec(dllexport) int on_create(void)
     audio_cache_manifest_cleanup_a();
     debug_line("on_create");
     patch_all_modules();
+    h5m_write_target_catalog();
     return 1;
 }
 

@@ -1,5 +1,24 @@
 # WebM performance regression checks
 
+Native H5M texture integration checks use the Windows D3D11 WARP renderer and
+the installed CRT TV screen PNG:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/run-h5m.ps1
+```
+
+These check real D3DX11 loading, native target registration, texture upload and
+pixel readback (including orientation), selective binding, Twitch/fallback
+selection, override matching, settings reload, idle playback cleanup, and COM
+reference release. They do not launch TK17 or connect to Twitch.
+
+Spatial checks use real dynamic D3D11 constant buffers with a synthetic verified
+Hook5 module layout. They cover object movement, camera translation/rotation,
+nearest shared-texture instance selection, shadow-camera rejection, unrelated
+buffer/material isolation, stale/invalid matrices, both projection handednesses,
+and source-relative OpenAL updates for local and Twitch audio. Actual audible
+direction/falloff and the live Hook5 capture still need an in-game check.
+
 The Twitch master-volume checks can be run with:
 
 ```powershell

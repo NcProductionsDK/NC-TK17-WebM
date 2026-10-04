@@ -47,6 +47,54 @@ FFmpeg warnings and errors remain visible, except for its harmless repeated
 repeat valid metadata; FFmpeg already skips it safely, so WebM suppresses only
 that exact message to prevent console-log spam.
 
+## Hook5 H5M object screens
+
+Native Hook5 object textures anywhere under `Mod/ActiveMod` (including all
+subfolders) can use
+the same sibling-file convention as TK17 textures: `Screen.png`, `Screen.webm`,
+and optionally `Screen.ini`. PNG, DDS, JPG, and TGA textures loaded through
+Hook5's synchronous D3DX11 file loader are supported. The H5M model stays
+unchanged. Video replaces only the matching shader-resource view; the original
+image is retained for fallback. A sidecar with a `[NC-TK17-WebM:Twitch]` section
+also enables Twitch-only screens without a local WebM.
+
+The WebM settings target list includes **H5M: folder - texture** entries.
+Select the screen, enter a channel, and enable the override to use the existing
+Twitch quality, chat, fallback and master-volume controls. **Auto assign (Rooms
+only)** still applies only to TK17 room sidecars; choose an H5M target explicitly.
+For a screen's own Twitch stream, set `channel` in its Twitch sidecar section.
+An empty channel uses local WebM unless the global override selects that screen.
+
+The native path reuses the existing decoder/audio player and supports both
+asynchronous and synchronous frame conversion. It uploads a single BGRA texture,
+preserves the H5M's UV coordinates/material settings, and releases playback
+resources after the screen has not been bound for 1.5 seconds. It shares the
+16-player pool with regular DirectX textures and tracks up to 32 eligible native
+views until the rendering device changes. Images beyond that limit stay static.
+Set `texture_audio_3d=true` in the screen INI for directional OpenAL sound that
+follows the H5M object's origin and the camera. This works for local WebM,
+the screen's own Twitch stream, and the global Twitch override; its master
+volume still applies. The supplied CRT TV enables this with the same defaults
+as toys: `audio_3d_min_distance=150`, `audio_3d_max_distance=1200` (centimeters),
+and `audio_3d_rolloff=3`. Set `texture_audio_3d=false` for ordinary stereo.
+Native objects use OpenAL instead of TK17 sound nodes; no `audio_node` is needed.
+
+Spatial capture supports the verified Hook5 2021 builds (PE timestamps
+`603CF2B9` / `603CF2C4`, image size `245000`). It observes CPU constant-buffer
+uploads and eligible diffuse texture bindings, with no GPU readback. Unknown
+builds or unavailable transforms retain centered sound. Shadow cameras are
+excluded, and mirror rendering uses the original object's position. Repeated
+instances of one screen texture share one player/emitter at the nearest
+rendered instance. The existing inactivity timeout still applies when Hook5
+stops submitting the screen. Surround output depends on the OpenAL device;
+headphones/stereo speakers receive directional panning.
+
+At startup the plugin scans native object texture sidecars and refreshes
+`Scripts/Shared/NCWebMH5MTargets.txt` in the WebM settings add-on, where the Lua
+sandbox can read it through the add-on index. Restart the game after adding
+screens to refresh this static target list. Tests cover real D3DX11 loading and
+D3D11 WARP texture readback; in-game validation is still needed.
+
 ## Twitch override master volume
 
 The **Twitch Master Volume** slider below **Override Enabled** controls only

@@ -119,7 +119,10 @@ static void check_lua(const char *dll_path, const char *script_path)
     CHECK(loadstring(state,
         "files_find=function() return {} end; ts=function() end; "
         "for _,case in ipairs({{'',1},{'0',0},{'1',1},{'1.75',1.75},{'2',2},{'-1',0},{'3',2},{'bad',1}}) do "
-        "file_load2=function() return '[NC-TK17-WebM:TwitchOverride]\\nmaster_volume='..case[1] end; "
+        "file_load2=function(path) if path=='Scripts/Shared/NCWebMH5MTargets.txt' then "
+        "return 'C:/Game/Mod/ActiveMod/Room Screens/CRT TV/NcToy7_TV_Screen.ini\\n'.."
+        "'C:/Game/Mod/ActiveMod/Room Screens/CRT TV/NcToy7_TV_Screen.ini\\n'.."
+        "'C:/unrelated.ini\\n' end; return '[NC-TK17-WebM:TwitchOverride]\\nmaster_volume='..case[1] end; "
         "local generated; add=function(text) generated=text end; dofile(settings_script); "
         "local block=assert(generated:match('CustomParameter :Parameter_NCWebMTwitchOverrideMasterVolume (.-)\\n};')); "
         "assert(tonumber(block:match('SliderDefault F32%((.-)%)'))==case[2]); "
@@ -128,6 +131,8 @@ static void check_lua(const char *dll_path, const char *script_path)
         "local volume=assert(generated:find('Twitch Master Volume:',1,true)); "
         "local target=assert(generated:find('Target object:',1,true)); "
         "assert(enabled<volume and volume<target); "
+        "local _,h5m_count=generated:gsub('H5M: CRT TV %- NcToy7_TV_Screen',''); assert(h5m_count==1); "
+        "assert(not generated:find('unrelated.ini',1,true)); "
         "local ids={}; for id in generated:gmatch('%.ParamID I32%((%d+)%)') do assert(not ids[id]); ids[id]=true end; "
         "end") == 0);
     if (pcall(state, 0, 0, 0)) {
