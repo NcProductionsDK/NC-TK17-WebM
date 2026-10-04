@@ -357,7 +357,6 @@ static FILETIME config_write_time;
 static DWORD last_global_config_check_tick;
 static unsigned int config_generation = 1;
 static int twitch_override_enabled;
-static float twitch_override_master_volume = 1.0f;
 static char twitch_override_target[MAX_PATH * 4];
 #define TWITCH_OVERRIDE_AUTO_ROOM "auto_room"
 static char twitch_override_auto_room[MAX_PATH];
@@ -392,10 +391,6 @@ static void *twitch_chat_width_slider_widget;
 static float twitch_chat_width_pending_value;
 static DWORD twitch_chat_width_pending_tick;
 static int twitch_chat_width_pending;
-static void *twitch_master_volume_slider_widget;
-static float twitch_master_volume_pending_value;
-static DWORD twitch_master_volume_pending_tick;
-static int twitch_master_volume_pending;
 static int webm_setting_sync_depth;
 
 typedef enum webm_setting_control_type_t {
@@ -412,7 +407,6 @@ typedef struct webm_setting_binding_t {
 
 static webm_setting_binding_t webm_setting_bindings[] = {
     { "NCWebMOverrideEnabled", "enabled", WEBM_SETTING_SPINBOX, NULL },
-    { "NCWebMTwitchOverrideMasterVolume", "master_volume", WEBM_SETTING_SLIDER, NULL },
     { "NCWebMOverrideTarget", "target", WEBM_SETTING_SPINBOX, NULL },
     { "NCWebMTwitchOverrideChannelOfflineFallback", "channel_offline_fallback", WEBM_SETTING_SPINBOX, NULL },
     { "NCWebMTwitchOverrideChatEnabled", "chat_enabled", WEBM_SETTING_SPINBOX, NULL },
@@ -901,7 +895,6 @@ typedef struct {
     unsigned int al_source;
     unsigned int al_buffer;
     int twitch_streaming;
-    int twitch_override_audio;
     int twitch_started;
     unsigned int twitch_buffers[WEBM_TWITCH_OPENAL_BUFFERS];
     unsigned int twitch_free_buffers[WEBM_TWITCH_OPENAL_BUFFERS];
@@ -929,7 +922,7 @@ static audio_graph_t *audio_graph_create(const char *path, int lead_ms, int volu
 static audio_graph_t *audio_graph_create_twitch_stream(const char *path, int volume,
                                                         int audio_3d, int min_distance,
                                                         int max_distance, int rolloff,
-                                                        const char *source_name, int override_audio);
+                                                        const char *source_name);
 static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t *dec,
                                              DWORD target_ms);
 static int video_decoder_twitch_audio_pop(video_decoder_t *dec, BYTE **buffer, size_t *capacity,
@@ -1329,7 +1322,6 @@ static int clamp_int(int value, int min_value, int max_value);
 static void load_config(void);
 static void refresh_global_config(DWORD now);
 static void reload_global_config_now(void);
-static int get_file_write_time_a(const char *path, FILETIME *write_time);
 static int slider_widget_value(void *slider, float *out_value);
 static void THISCALL hook_ConfigEditor_ParamChange(void *self, const char *parameter,
                                                    const char *value, DWORD arg3, DWORD arg4);
@@ -1653,24 +1645,12 @@ static void write_twitch_override_value_a(const char *key, const char *value)
     if (!key || !value) return;
     load_config();
     if (!config_path_global[0]) return;
-    /* Process any external edits before consuming our own file timestamp. */
-    if (strcmp(key, "master_volume") == 0) {
-        last_global_config_check_tick = 0;
-        refresh_global_config(GetTickCount());
-    }
     if (!WritePrivateProfileStringA("NC-TK17-WebM:TwitchOverride", key, value,
                                     config_path_global)) {
         log_line("Twitch override write failed key=\"%s\"", key);
         return;
     }
-    if (strcmp(key, "master_volume") == 0) {
-        /* Audio reads this multiplier for each new PCM buffer. Keep the
-           decoder/session alive instead of advancing config_generation. */
-        twitch_override_master_volume = (float)strtod(value, NULL);
-        get_file_write_time_a(config_path_global, &config_write_time);
-    } else {
-        reload_global_config_now();
-    }
+    reload_global_config_now();
 }
 
 static void show_twitch_channel_dialog(void)
@@ -1956,10 +1936,7 @@ static int webm_setting_ini_slider_value(
     if (end == text || !_finite(parsed)) return 0;
     while (*end && isspace((unsigned char)*end)) ++end;
     if (*end) return 0;
-    if (strcmp(binding->key, "master_volume") == 0) {
-        if (parsed < 0.0) parsed = 0.0;
-        if (parsed > 2.0) parsed = 2.0;
-    } else if (strcmp(binding->key, "chat_width") == 0) {
+    if (strcmp(binding->key, "chat_width") == 0) {
         if (parsed < 0.20) parsed = 0.20;
         if (parsed > 0.60) parsed = 0.60;
     } else {
@@ -2088,30 +2065,6 @@ static int slider_widget_value(void *slider, float *out_value)
     if (!_finite(value)) return 0;
     *out_value = value;
     return 1;
-}
-
-static void queue_twitch_master_volume(float value)
-{
-    if (!_finite(value)) return;
-    if (value < 0.0f) value = 0.0f;
-    if (value > 2.0f) value = 2.0f;
-    twitch_master_volume_pending_value = value;
-    twitch_master_volume_pending_tick = GetTickCount();
-    twitch_master_volume_pending = 1;
-}
-
-static void flush_twitch_master_volume(DWORD now)
-{
-    char normalized[32];
-    float difference;
-    if (!twitch_master_volume_pending ||
-        now - twitch_master_volume_pending_tick < 200) return;
-    twitch_master_volume_pending = 0;
-    difference = twitch_master_volume_pending_value - twitch_override_master_volume;
-    if (fabsf(difference) < 0.0005f) return;
-    _snprintf(normalized, sizeof(normalized), "%.3f", twitch_master_volume_pending_value);
-    normalized[sizeof(normalized) - 1] = 0;
-    write_twitch_override_value_a("master_volume", normalized);
 }
 
 static void queue_twitch_chat_opacity(float value)
@@ -2271,9 +2224,7 @@ static int THISCALL hook_Customizer_CreateSlider(void *self, void *parameter,
     }
     if (slider) {
         binding->slider_widget = slider;
-        if (strcmp(parameter_name, "NCWebMTwitchOverrideMasterVolume") == 0) {
-            twitch_master_volume_slider_widget = slider;
-        } else if (strcmp(parameter_name, "NCWebMTwitchOverrideChatOverlayOpacity") == 0) {
+        if (strcmp(parameter_name, "NCWebMTwitchOverrideChatOverlayOpacity") == 0) {
             twitch_chat_opacity_slider_widget = slider;
             debug_line("ConfigEditor Twitch chat opacity slider connected widget=%p",
                        slider);
@@ -2284,9 +2235,7 @@ static int THISCALL hook_Customizer_CreateSlider(void *self, void *parameter,
         }
         if (preset_index < 0) {
             webm_sync_slider_from_ini(binding, slider);
-            if (strcmp(binding->key, "master_volume") == 0)
-                twitch_master_volume_pending = 0;
-            else if (strcmp(binding->key, "chat_background_opacity") == 0)
+            if (strcmp(binding->key, "chat_background_opacity") == 0)
                 twitch_chat_opacity_pending = 0;
             else
                 twitch_chat_width_pending = 0;
@@ -2348,17 +2297,6 @@ static void THISCALL hook_ConfigEditor_ParamChange(void *self, const char *param
         write_twitch_override_value_a(
             "chat_animated_emotes",
             has_value && override_value_is_enabled_a(value_text) ? "true" : "false");
-    } else if (strcmp(parameter_text, "NCWebMTwitchOverrideMasterVolume") == 0) {
-        float slider_value;
-        if (slider_widget_value(twitch_master_volume_slider_widget, &slider_value)) {
-            queue_twitch_master_volume(slider_value);
-        } else if (has_value) {
-            char *end = NULL;
-            double parsed = strtod(value_text, &end);
-            if (end != value_text && _finite(parsed)) {
-                queue_twitch_master_volume((float)parsed);
-            }
-        }
     } else if (strcmp(parameter_text, "NCWebMTwitchOverrideChatOverlayOpacity") == 0) {
         float slider_value;
         if (slider_widget_value(twitch_chat_opacity_slider_widget, &slider_value)) {
@@ -3406,7 +3344,7 @@ static audio_graph_t *audio_graph_create_openal_3d(const char *path, int volume,
 static audio_graph_t *audio_graph_create_twitch_stream(const char *path, int volume,
                                                         int audio_3d, int min_distance,
                                                         int max_distance, int rolloff,
-                                                        const char *source_name, int override_audio)
+                                                        const char *source_name)
 {
     audio_graph_t *ag;
     float gain;
@@ -3423,7 +3361,6 @@ static audio_graph_t *audio_graph_create_twitch_stream(const char *path, int vol
     ag->openal = 1;
     ag->active = 1;
     ag->twitch_streaming = 1;
-    ag->twitch_override_audio = override_audio;
     ag->volume = clamp_int(volume, -10000, 20000);
     ag->audio_3d = audio_3d && source_name && source_name[0] ? 1 : 0;
     ag->min_distance = clamp_int(min_distance, 1, 100000);
@@ -3551,18 +3488,6 @@ static int twitch_audio_playback_clock(const audio_graph_t *ag,
     return 1;
 }
 
-static void twitch_override_scale_pcm(short *pcm, int sample_count, float gain)
-{
-    int i;
-    if (!pcm || gain == 1.0f) return;
-    for (i = 0; i < sample_count; ++i) {
-        float sample = (float)pcm[i] * gain;
-        if (sample > 32767.0f) sample = 32767.0f;
-        if (sample < -32768.0f) sample = -32768.0f;
-        pcm[i] = (short)sample;
-    }
-}
-
 static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t *dec,
                                              DWORD target_ms)
 {
@@ -3622,15 +3547,6 @@ static void audio_graph_update_twitch_stream(audio_graph_t *ag, video_decoder_t 
             }
             bytes = samples * (int)sizeof(short);
             format = AL_FORMAT_MONO16_;
-        }
-        /* Keep the existing source gain/distance behavior. PCM scaling also
-           boosts on OpenAL drivers that clamp source gain to unity. */
-        if (ag->twitch_override_audio) {
-            twitch_override_scale_pcm((short*)ag->twitch_pcm,
-                                      bytes / (int)sizeof(short),
-                                      twitch_master_volume_pending ?
-                                          twitch_master_volume_pending_value :
-                                          twitch_override_master_volume);
         }
         vm_alBufferData(buffer, format, ag->twitch_pcm, bytes, sample_rate);
         vm_alSourceQueueBuffers(ag->al_source, 1, &buffer);
@@ -4727,8 +4643,6 @@ static int convert_rgb24_to_d3d8_scalar(BYTE *dst_base, int dst_pitch, int forma
     return 1;
 }
 
-#include "webm_rgb_simd.h"
-
 /* Preserve the scalar converter's exact nearest-neighbour coordinates,
  * vertical flip, channel order and opaque alpha. The supported texture width
  * is at most 4096; retain the original routine for larger callers. */
@@ -4760,16 +4674,6 @@ static int convert_rgb24_to_d3d8(BYTE *dst_base, int dst_pitch, int format,
             error -= width;
         }
     }
-    if (bpp == 4 && width >= 64 && height >= 16 && source_width >= 6 &&
-        source_width <= width && webm_rgb_has_ssse3() &&
-        webm_rgb_shuffle_convert(dst_base, dst_pitch, format, width, height,
-                                 source_frame, source_width, source_height,
-                                 source_stride, offsets)) return 1;
-    if (bpp == 4 && width >= 64 && height >= 16 && source_width > width &&
-        webm_rgb_has_ssse3() &&
-        webm_rgb_gather_convert(dst_base, dst_pitch, format, width, height,
-                                source_frame, source_width, source_height,
-                                source_stride, offsets)) return 1;
     for (y = 0; y < height; y++) {
         BYTE *dst = dst_base + (size_t)y * (size_t)dst_pitch;
         int sy = ((height - 1 - y) * source_height) / height;
@@ -6364,7 +6268,6 @@ static webm_twitch_session_t *create_twitch_session_a(const char *sidecar_ini,
     }
     configured = webm_twitch_load_settings(config_path_global, sidecar_ini, settings);
     forced_override = twitch_override_matches_sidecar_a(sidecar_ini);
-    settings->override_audio = forced_override;
     if (forced_override) {
         settings->enabled = 1;
         /* Reuse the sidecar resolver's existing fixed-channel-first random
@@ -6584,7 +6487,7 @@ static int update_twitch_decoder_a(webm_twitch_session_t *session,
                                                                 twitch_min_distance,
                                                                 twitch_max_distance,
                                                                 twitch_rolloff,
-                                                                audio_node, settings->override_audio);
+                                                                audio_node);
                 if (!*audio_graph) {
                     log_line("Twitch audio unavailable; continuing video-only source=%s channel=\"%s\"",
                              label, active_channel[0] ? active_channel : settings->channel);
@@ -6610,7 +6513,7 @@ static int update_twitch_decoder_a(webm_twitch_session_t *session,
                                                             twitch_min_distance,
                                                             twitch_max_distance,
                                                             twitch_rolloff,
-                                                            audio_node, settings->override_audio);
+                                                            audio_node);
         }
         return 0;
     }
@@ -13445,7 +13348,6 @@ static BOOL WINAPI hook_SwapBuffers(HDC hdc)
     LONGLONG perf_start = 0;
     flush_twitch_chat_opacity(now);
     flush_twitch_chat_width(now);
-    flush_twitch_master_volume(now);
     if (performance_profile) {
         webm_perf_prepare(now);
         perf_start = webm_perf_counter();
@@ -13979,7 +13881,6 @@ static HRESULT WINAPI hook_d3d8_Present(IDirect3DDevice8 *self, const RECT *src_
     HRESULT hr;
     flush_twitch_chat_opacity(now);
     flush_twitch_chat_width(now);
-    flush_twitch_master_volume(now);
     if (performance_profile) {
         webm_perf_prepare(now);
         perf_start = webm_perf_counter();
@@ -15004,8 +14905,6 @@ static void write_default_config_if_missing(const char *path)
         "; and applies no override when the loaded room has no compatible sidecar.\r\n"
         "; Disabling the override restores the sidecar's normal Twitch, WebM, or image behavior.\r\n"
         "enabled=0\r\n"
-        "; Override-only master multiplier: 0=mute, 1=unchanged, 2=double amplitude.\r\n"
-        "master_volume=1.0\r\n"
         "target=\r\n"
         "channel=\r\n"
         "; When the configured channel is unavailable: fallback or random.\r\n"
@@ -15080,19 +14979,6 @@ static void load_config_values(int log_enabled)
     performance_profile = profile_key_bool_a(path, "NC-TK17-WebM", "performance_profile", performance_profile);
     async_decoding = profile_key_bool_a(path, "NC-TK17-WebM", "async_decoding", async_decoding);
     twitch_override_enabled = profile_key_bool_a(path, "NC-TK17-WebM:TwitchOverride", "enabled", 0);
-    GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", "master_volume", "1.0",
-                             override_value, sizeof(override_value), path);
-    override_end = NULL;
-    override_number = strtod(override_value, &override_end);
-    if (override_end == override_value || !_finite(override_number)) {
-        override_number = 1.0;
-    } else {
-        while (isspace((unsigned char)*override_end)) ++override_end;
-        if (*override_end) override_number = 1.0;
-    }
-    if (override_number < 0.0) override_number = 0.0;
-    if (override_number > 2.0) override_number = 2.0;
-    twitch_override_master_volume = (float)override_number;
     GetPrivateProfileStringA("NC-TK17-WebM:TwitchOverride", "target", "",
                              twitch_override_target, sizeof(twitch_override_target), path);
     if (!twitch_override_uses_auto_room_a()) {

@@ -9,8 +9,6 @@ static void *test_realloc(void *ptr, size_t bytes)
 #include "../NC-TK17-WebM.c"
 #undef realloc
 #include "reference_playback.h"
-#include "reference_conversion_pre_simd.h"
-#include "reference_conversion_first_simd.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 static unsigned random_state = 1234567;
@@ -38,12 +36,6 @@ static void check_conversion(int sw, int sh, int w, int h, int format, int paddi
     CHECK(convert_rgb24_to_d3d8_scalar(expected + 1, pitch, format, w, h, src, sw, sh, stride));
     CHECK(convert_rgb24_to_d3d8(actual + 1, pitch, format, w, h, src, sw, sh, stride));
     CHECK(memcmp(expected, actual, size) == 0); /* Includes padding and guards. */
-    memset(actual, 0xCD, size);
-    CHECK(convert_rgb24_to_d3d8_pre_simd(actual + 1, pitch, format, w, h, src, sw, sh, stride));
-    CHECK(memcmp(expected, actual, size) == 0);
-    memset(actual, 0xCD, size);
-    CHECK(convert_rgb24_to_d3d8_first_simd(actual + 1, pitch, format, w, h, src, sw, sh, stride));
-    CHECK(memcmp(expected, actual, size) == 0);
     free(src); free(expected); free(actual);
 }
 
@@ -293,44 +285,6 @@ static void test_concurrent_live_queue(void)
 }
 
 typedef int (*convert_fn)(BYTE*, int, int, int, int, const BYTE*, int, int, int);
-
-static void test_conversion_guard_pages(void)
-{
-    SYSTEM_INFO info;
-    BYTE *src_alloc, *dst_alloc;
-    DWORD old;
-    int width, format_index;
-    int formats[] = { D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8, WEBM_CACHE_FORMAT_GL_RGBA };
-    GetSystemInfo(&info);
-    src_alloc = VirtualAlloc(NULL, info.dwPageSize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    dst_alloc = VirtualAlloc(NULL, info.dwPageSize * 3, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    CHECK(src_alloc && dst_alloc);
-    CHECK(VirtualProtect(src_alloc + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old));
-    CHECK(VirtualProtect(dst_alloc + info.dwPageSize * 2, info.dwPageSize, PAGE_NOACCESS, &old));
-    /* Tightly packed final rows end exactly at an inaccessible page. Test
-     * every vector tail and source alignment, including minimum source width. */
-    for (width = 64; width <= 79; width++) {
-        int sw;
-        for (sw = 6; sw <= 85; sw++) {
-            BYTE *src = src_alloc + info.dwPageSize - sw * 3 * 16;
-            BYTE *dst = dst_alloc + info.dwPageSize * 2 - width * 4 * 16;
-            BYTE expected[79 * 4 * 16];
-            int i;
-            for (i = 0; i < sw * 3 * 16; i++) src[i] = (BYTE)(random_value() >> 24);
-            for (format_index = 0; format_index < 3; format_index++) {
-                CHECK(convert_rgb24_to_d3d8_scalar(expected, width * 4, formats[format_index],
-                      width, 16, src, sw, 16, sw * 3));
-                CHECK(convert_rgb24_to_d3d8(dst, width * 4, formats[format_index],
-                      width, 16, src, sw, 16, sw * 3));
-                CHECK(memcmp(expected, dst, width * 4 * 16) == 0);
-            }
-        }
-    }
-    VirtualFree(src_alloc, 0, MEM_RELEASE);
-    VirtualFree(dst_alloc, 0, MEM_RELEASE);
-    puts("SIMD source/destination guard pages: tight rows, unaligned addresses and all tails passed");
-}
-
 static double benchmark(convert_fn fn, BYTE *dst, BYTE *src, int sw, int sh, int w, int h, int format)
 {
     LARGE_INTEGER frequency, start, end;
@@ -343,26 +297,12 @@ static double benchmark(convert_fn fn, BYTE *dst, BYTE *src, int sw, int sh, int
     return (double)(end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart / 40.0;
 }
 
-static double median_seven(double *values)
-{
-    int i, j;
-    for (i = 1; i < 7; i++) {
-        double value = values[i];
-        for (j = i; j > 0 && values[j - 1] > value; j--) values[j] = values[j - 1];
-        values[j] = value;
-    }
-    return values[3];
-}
-
 int main(void)
 {
     int formats[] = {D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8, D3DFMT_R8G8B8,
                      D3DFMT_R5G6B5, WEBM_CACHE_FORMAT_GL_RGB, WEBM_CACHE_FORMAT_GL_RGBA};
     int cases[][4] = {{3840,2160,2048,1152}, {1920,1080,2048,1024},
-                     {1280,720,2048,1152}, {1920,1080,1920,1080},
-                     {1280,720,2048,1024}, {1280,720,1024,512},
-                     {1920,1080,1024,512}, {1920,1080,512,256},
-                     {3840,2160,1024,512}, {1280,720,256,128}};
+                     {1280,720,2048,1152}, {1920,1080,1920,1080}};
     int i, f;
     for (f = 0; f < 6; f++) {
         check_conversion(1, 1, 1, 1, formats[f], 0);
@@ -376,48 +316,23 @@ int main(void)
         for (i = 0; i < 5; i++)
             check_conversion(3840, 2160, 2048 >> i, 1152 >> i, formats[f], i);
     }
-    puts("Conversion: 2148 byte-exact cases passed against scalar and previous production converter");
-    test_conversion_guard_pages();
-    for (f = 0; f < 6; f++) {
-        for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++)
-            check_conversion(cases[i][0], cases[i][1], cases[i][2], cases[i][3], formats[f], i);
-        check_conversion(1920, 33, 4096, 65, formats[f], 1);
-    }
-    puts("Full-size video cases and maximum 4096-pixel width passed in all six formats");
-    {
-        LONG detected = webm_rgb_ssse3_state;
-        webm_rgb_ssse3_state = -1; /* Exercise dispatch on CPUs without SSSE3. */
-        for (f = 0; f < 6; f++) check_conversion(127, 65, 257, 129, formats[f], 3);
-        webm_rgb_ssse3_state = detected;
-        printf("Runtime SSSE3 support: %s; forced fallback passed\n", detected > 0 ? "yes" : "no");
-    }
+    puts("Conversion: 2148 byte-exact cases passed (6 formats, padding, scaling, mips)");
     test_publication();
     test_live_queue();
     puts("Publication and Twitch queue match the original routines");
     test_memory_fallback();
     test_concurrent_publication();
     test_concurrent_live_queue();
-    for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+    for (i = 0; i < 4; i++) {
         int sw = cases[i][0], sh = cases[i][1], w = cases[i][2], h = cases[i][3];
         BYTE *src = (BYTE*)malloc((size_t)sw * sh * 3);
         BYTE *dst = (BYTE*)malloc((size_t)w * h * 4);
         double old_ms, new_ms;
-        double old_runs[7], new_runs[7];
-        int run;
         CHECK(src && dst);
         memset(src, 123, (size_t)sw * sh * 3);
-        for (run = 0; run < 7; run++) {
-            if (run & 1) {
-                new_runs[run] = benchmark(convert_rgb24_to_d3d8, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
-                old_runs[run] = benchmark(convert_rgb24_to_d3d8_first_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
-            } else {
-                old_runs[run] = benchmark(convert_rgb24_to_d3d8_first_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
-                new_runs[run] = benchmark(convert_rgb24_to_d3d8, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
-            }
-        }
-        old_ms = median_seven(old_runs);
-        new_ms = median_seven(new_runs);
-        printf("BGRA %dx%d -> %dx%d median: old %.3f ms, new %.3f ms, %.2fx\n",
+        old_ms = benchmark(convert_rgb24_to_d3d8_scalar, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
+        new_ms = benchmark(convert_rgb24_to_d3d8, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
+        printf("BGRA %dx%d -> %dx%d: old %.3f ms, new %.3f ms, %.2fx\n",
                sw, sh, w, h, old_ms, new_ms, old_ms / new_ms);
         free(src); free(dst);
     }

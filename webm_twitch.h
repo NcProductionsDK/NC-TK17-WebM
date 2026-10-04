@@ -34,6 +34,7 @@ typedef struct {
     DWORD connect_timeout_ms;
     DWORD reconnect_interval_ms;
     int audio_volume;
+    int override_audio; /* Runtime marker: apply the override master multiplier. */
     int audio_3d_min_distance;
     int audio_3d_min_distance_set;
     int audio_3d_max_distance;

@@ -10,7 +10,6 @@ static void *test_realloc(void *ptr, size_t bytes)
 #undef realloc
 #include "reference_playback.h"
 #include "reference_conversion_pre_simd.h"
-#include "reference_conversion_first_simd.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 static unsigned random_state = 1234567;
@@ -40,9 +39,6 @@ static void check_conversion(int sw, int sh, int w, int h, int format, int paddi
     CHECK(memcmp(expected, actual, size) == 0); /* Includes padding and guards. */
     memset(actual, 0xCD, size);
     CHECK(convert_rgb24_to_d3d8_pre_simd(actual + 1, pitch, format, w, h, src, sw, sh, stride));
-    CHECK(memcmp(expected, actual, size) == 0);
-    memset(actual, 0xCD, size);
-    CHECK(convert_rgb24_to_d3d8_first_simd(actual + 1, pitch, format, w, h, src, sw, sh, stride));
     CHECK(memcmp(expected, actual, size) == 0);
     free(src); free(expected); free(actual);
 }
@@ -311,7 +307,7 @@ static void test_conversion_guard_pages(void)
      * every vector tail and source alignment, including minimum source width. */
     for (width = 64; width <= 79; width++) {
         int sw;
-        for (sw = 6; sw <= 85; sw++) {
+        for (sw = 6; sw <= width; sw++) {
             BYTE *src = src_alloc + info.dwPageSize - sw * 3 * 16;
             BYTE *dst = dst_alloc + info.dwPageSize * 2 - width * 4 * 16;
             BYTE expected[79 * 4 * 16];
@@ -360,9 +356,7 @@ int main(void)
                      D3DFMT_R5G6B5, WEBM_CACHE_FORMAT_GL_RGB, WEBM_CACHE_FORMAT_GL_RGBA};
     int cases[][4] = {{3840,2160,2048,1152}, {1920,1080,2048,1024},
                      {1280,720,2048,1152}, {1920,1080,1920,1080},
-                     {1280,720,2048,1024}, {1280,720,1024,512},
-                     {1920,1080,1024,512}, {1920,1080,512,256},
-                     {3840,2160,1024,512}, {1280,720,256,128}};
+                     {1280,720,2048,1024}, {1280,720,1024,512}};
     int i, f;
     for (f = 0; f < 6; f++) {
         check_conversion(1, 1, 1, 1, formats[f], 0);
@@ -409,9 +403,9 @@ int main(void)
         for (run = 0; run < 7; run++) {
             if (run & 1) {
                 new_runs[run] = benchmark(convert_rgb24_to_d3d8, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
-                old_runs[run] = benchmark(convert_rgb24_to_d3d8_first_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
+                old_runs[run] = benchmark(convert_rgb24_to_d3d8_pre_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
             } else {
-                old_runs[run] = benchmark(convert_rgb24_to_d3d8_first_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
+                old_runs[run] = benchmark(convert_rgb24_to_d3d8_pre_simd, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
                 new_runs[run] = benchmark(convert_rgb24_to_d3d8, dst, src, sw, sh, w, h, D3DFMT_X8R8G8B8);
             }
         }

@@ -13,6 +13,10 @@ Install the MSYS2 MinGW 32-bit toolchain, then run:
 
 The compiled DLL is written to `build\NC-TK17-WEBM.dll`.
 
+The RGB24 conversion worker uses SSSE3 automatically on supported CPUs for
+eligible BGRA/RGBA textures, preserving identical output and existing settings.
+See [conversion measurements and validation](SIMD-CONVERSION-20260920.md).
+
 ## Hook5 direct upload
 
 `directx_d3d11_upload=true` enables a guarded fast path when Hook5 is active.
@@ -42,6 +46,19 @@ FFmpeg warnings and errors remain visible, except for its harmless repeated
 `Found duplicated MOOV Atom` warning. Some live MP4 streams periodically
 repeat valid metadata; FFmpeg already skips it safely, so WebM suppresses only
 that exact message to prevent console-log spam.
+
+## Twitch override master volume
+
+The **Twitch Master Volume** slider below **Override Enabled** controls only
+the selected override's live Twitch audio. Center (1.0) preserves the existing
+volume, left reduces it to mute (0), and right boosts it to twice the sample
+amplitude (2.0). The setting is saved as `master_volume` in
+`[NC-TK17-WebM:TwitchOverride]` and restored when the settings page opens.
+Dragging applies to newly queued audio without reconnecting the stream; the
+saved value is written after a short pause. Regular WebM fallback audio and
+Twitch sources outside the override keep their existing volume. Boosted samples
+are clipped to the PCM range to prevent integer wraparound; loud material may
+distort at high boost.
 
 ## Twitch override offline fallback
 

@@ -1,5 +1,17 @@
 # WebM performance regression checks
 
+The Twitch master-volume checks can be run with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/run-twitch-volume.ps1
+```
+
+They exercise production stereo/spatial audio queuing, neutral volume, mute,
+attenuation, amplification with clipping, override isolation, live slider values,
+and saved settings without advancing the playback restart generation. They also
+execute the settings-page generator with the game's Lua runtime to check slider
+placement, range, saved defaults, and unique parameter IDs.
+
 Run from the repository root with the existing 32-bit MSYS2 compiler:
 
 ```powershell
